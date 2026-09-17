@@ -134,9 +134,9 @@ ip_version: 4 | 6
 | `sync.mode` | 写入通道 | `rewrite-api`（唯一支持值） |
 | `sync.wildcard` | 是否允许生成 `*.zone` 通配条目（D14）；`false` 时 zone 组全部降级精确 | `true` |
 | `sync.ttl` | pending → removed 淘汰时长 | `720h`（30d） |
-| `sync.rate_limit` / `sync.retry` | 写操作限速 / 重试次数（live 模式消费，M5–M6） | `200ms` / `3` |
+| `sync.rate_limit` / `sync.retry` | 写操作限速 / 重试次数（live 模式消费，已实现） | `200ms` / `3` |
 | `runtime.db_path` | SQLite 路径 | `./data/state.db` |
-| `runtime.apply` | 是否真正执行写计划 | `false`（默认 dry-run；M5–M6 前 `--apply` 恒以退出码 2 报错，D10） |
+| `runtime.apply` | 是否真正执行写计划 | `false`（默认 dry-run；显式 `--apply` 才写入，D10） |
 | `runtime.log_level` / `log_file` | 日志级别 / 文件 | `info` / 空（stderr） |
 | `runtime.schedule` | 内置调度 cron 表达式（P1） | 空（P0 单次运行退出） |
 

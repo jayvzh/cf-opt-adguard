@@ -1,6 +1,6 @@
 # cf-opt-adguard 目录职责与模块边界（PROJECT_STRUCTURE.md）
 
-> 版本：v0.2 ｜ 状态：M1–M4（P0 dry-run 全链路）已实现，本文已与代码核实对齐；`syncer` / `verifier` 属 M5–M6 待建。禁止预实现 P1 / P2 模块。
+> 版本：v0.3 ｜ 状态：M1–M6（P0 全量：dry-run + `--apply` live 写入与验证）已实现，本文已与代码核实对齐。禁止预实现 P1 / P2 模块。
 > 本文只回答：放哪——目录职责、包边界、阶段间数据流。运行机制见 [ARCHITECTURE.md](ARCHITECTURE.md)，表结构见 [DATA_MODEL.md](DATA_MODEL.md)。
 > 相关：[ARCHITECTURE.md](ARCHITECTURE.md)、[DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md)。
 > 更新时机：新增 / 重命名 / 移动包，或阶段间数据流变化时（同步检查本文与依赖矩阵）。
@@ -22,9 +22,9 @@ cf-opt-adguard/
 │   ├── detector/                # 已实现：F3：resolver / cidr / httphead / 打分（打分纯函数）
 │   ├── ipselector/              # 已实现：F4：优选 IP 三来源（默认读 CFST result.csv，D17）
 │   ├── planner/                 # 已实现：F6：现状对比，产出 add/update/remove 计划（纯函数）
-│   ├── syncer/                  # M5–M6 待建：F5：执行 AGH rewrite 写操作（全工程唯一写侧）
-│   ├── verifier/                # M5–M6 待建：F8：经 AGH 回查 DNS 验证
-│   ├── adguard/                 # 已实现（只读）：auth / querylog / rewrite list；写端点封装随 M5 补齐
+│   ├── syncer/                  # 已实现：F5：执行 AGH rewrite 写操作（全工程唯一写侧，仅 --apply）
+│   ├── verifier/                # 已实现：F8：经 AGH 回查 DNS 验证
+│   ├── adguard/                 # 已实现：auth / querylog / rewrite list / rewrite add·update·delete
 │   ├── state/                   # 已实现：SQLite 仓储、迁移（migrations/0001_init.sql 定稿）、容量护栏（D15）
 │   └── (notify/ P1 再建，MVP 不允许出现)
 ├── config.example.yaml          # 已实现：配置模板（不含真实密码，D17 已同步）
@@ -89,7 +89,7 @@ cf-opt-adguard/
 
 - `main.go` 已实现为子命令分发：`run`（config.Load → 依赖装配 → pipeline.Run → 按退出码退出）、`version`、`export`（只读导出 CSV）；禁止在 main 写业务。
 - 依赖组装集中在 `main.go` 的 run 子命令装配处完成，避免业务包互相感知构造细节。
-- CLI 用标准库 `flag` 子命令解析；命令契约以 [API.md](API.md) §7 为准（M5–M6 前仅此三个子命令）。
+- CLI 用标准库 `flag` 子命令解析；命令契约以 [API.md](API.md) §7 为准（P0 仅此三个子命令）。
 
 ## 6. 可测试性约束
 

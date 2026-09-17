@@ -1,6 +1,6 @@
 # cf-opt-adguard
 
-> 状态：**M1–M4 已实现（dry-run 全链路可用）**，`syncer` / `verifier` 属 M5–M6 待建，当前 `--apply` 会明确报错退出（码 2）。文档集已与代码核实对齐（2026-09-17）。
+> 状态：**M1–M6 已实现（dry-run + `--apply` live 写入与 DNS 回查验证全链路可用）**。文档集已与代码核实对齐（2026-09-18）。
 
 一个本地运行的 **AdGuard Home × Cloudflare 优选 IP 自动编排器**：从 AGH 查询日志挖掘高频域名，独立探测确认 Cloudflare CDN，把优选 IP 增量写为 AGH 的 DNS 重写规则，并持续维护（新站点自动加入、失效站点自动淘汰）。
 

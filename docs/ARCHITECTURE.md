@@ -1,6 +1,6 @@
 # cf-opt-adguard 技术架构与运行机制（ARCHITECTURE.md）
 
-> 版本：v0.2 ｜ 状态：M1–M4 已实现（collector → pipeline dry-run 全链路落地，本文已与代码核实对齐）；syncer / verifier 属 M5–M6 待建，其行为描述仍为设计稿。
+> 版本：v0.3 ｜ 状态：M1–M6 全部实现（collector → aggregate → detector → ipselector → planner → syncer → verifier → pipeline dry-run / `--apply` live 全链路落地，本文已与代码核实对齐）。
 > 本文只回答：怎么跑——分层依赖、流水线机制、探测打分、同步与调度、失败处理。接口字段归 [API.md](API.md)，表结构归 [DATA_MODEL.md](DATA_MODEL.md)，目录落位归 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)。
 > 相关：上游 [PRD.md](PRD.md)；选型理由 [decisions.md](decisions.md)；已知坑 [pitfalls.md](pitfalls.md)。
 > 更新时机：流水线阶段、核心机制、技术选型、同步 / 调度 / 失败策略变化时。
@@ -36,7 +36,7 @@ confirmed_cf 域名列表（maybe / not 仅落状态库）
 [planner 计划器] AGH 现有 rewrite + 本地状态 → add/update/remove 计划（纯函数）
       │
       ▼
-[syncer 同步器] 唯一写侧：调用 AGH Rewrite API（M5–M6 待建；当前版本 dry-run 只打印不执行）
+[syncer 同步器] 唯一写侧：调用 AGH Rewrite API（仅 --apply live 模式执行；dry-run 空转）
       │
       ▼
 [verifier 验证器] 经 AGH 回查解析结果，标记失败条目
@@ -132,17 +132,19 @@ confirmed_cf 域名列表（maybe / not 仅落状态库）
   - **remove**：托管域名在 AGH 中的条目，答案与本次期望不符且属同一 IP 族（异族答案互补共存不清理）；本阶段 remove 只打印不执行。
 - 计划是一份不可变数据结构，默认 dry 模式打印与 `--apply` 后的 live 执行消费同一份计划。
 
-### 4.6 syncer（同步，唯一写侧）
+### 4.6 syncer（同步，唯一写侧，已实现）
 
-- 全工程只有本包允许调用 AGH rewrite 写端点（add / update / delete）。
-- 仅在 `--apply`（live）模式执行；dry 模式下本阶段空转。逐条执行：限速、指数退避重试（可配次数）；单条最终失败记录到状态库并继续下一条，不中断整批。
-- 严格幂等：执行前以 list 现状为准；add 已存在则降级为 update 判断；delete 已不存在视为成功。
-- 禁止"全量删除 + 全量添加"。
+- 全工程只有本包允许调用 AGH rewrite 写端点（add / update / delete）；仅消费 planner 计划，不自产条目。
+- 仅在 `--apply`（live）模式执行；dry 模式下本阶段空转。逐条执行：限速（`sync.rate_limit`，默认 200ms）、指数退避重试（`sync.retry`，默认 3 次，401/403 鉴权错误不重试）；单条最终失败记录到状态库并继续下一条，不中断整批。
+- 严格幂等：以 list 现状为准（包内维护 current 视图，随每次写成功同步更新，保证批内后续判断准确）；add 已存在则降级为 update 判断；delete 已不存在视为成功。
+- 禁止"全量删除 + 全量添加"；v4/v6 异族答案互补共存，update 只替换同族答案。
+- 成功后写状态库：`state=active`、`agh_present=true`；`first_synced` 只在首次成功写入时填定，此后不变（D18）。
 
-### 4.7 verifier（验证）
+### 4.7 verifier（验证，已实现）
 
-- 同步完成后向 AGH（指定 AGH 为 server）发起 DNS 查询，比对应答是否等于目标 answer。
-- 失败条目标记 `last_error` 并计入运行汇总；自动回滚为 P1（MVP 至少保证 dry-run 可预览、失败可见）。
+- 同步完成后向 AGH（作为 DNS server，`host:53`，从 `--agh-url` 主机推导）发起 UDP DNS 查询（复用 miekg/dns），v4 查 A / v6 查 AAAA，比对应答是否等于目标 answer。
+- wildcard 条目用测试子域 `cf-opt-verify.<zone>` 回查，不污染真实子域。
+- 失败条目标记 `last_error`（保留原状态）并计入运行汇总；自动回滚为 P1（MVP 至少保证 dry-run 可预览、失败可见）。
 
 ## 5. 托管状态机
 

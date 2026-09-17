@@ -9,11 +9,11 @@
 
 `cf-opt-adguard` 是一个本地运行的外部编排器：从 AdGuard Home 查询日志挖高频域名 → 独立探测确认 Cloudflare CDN → 取优选 IP → 通过 AGH Rewrite API 增量写入 DNS 重写。完整需求见 [PRD.md](PRD.md)，运行机制见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-## 2. 当前状态（2026-09-17）
+## 2. 当前状态（2026-09-18）
 
-- **阶段：M1–M4（P0 dry-run 全链路）已实现**——collector → aggregate → detector → ipselector → planner → pipeline dry-run 打印全部落地并通过 `go build / vet / test` 与 httptest 集成测试；`syncer` / `verifier` 属 M5–M6 待建，当前 `--apply` 恒以退出码 2 报错。
+- **阶段：M1–M6（P0 全量）已实现**——collector → aggregate → detector → ipselector → planner → syncer → verifier → pipeline 全链路落地（dry-run 默认 + `--apply` live 写入与回查验证），通过 `go build / vet / test` 与 httptest 集成测试（含 live 端到端与部分失败退出码 4 用例）。
 - 本机环境：Go 1.27.1（linux/amd64）；module path `cf-opt-adguard`。
-- 文档状态：PRD v0.3（D17）；ARCHITECTURE / DATA_MODEL / PROJECT_STRUCTURE 已与代码核实对齐；决策记录至 D17（含 D14 域名归并、D15 容量护栏、D16 cdncheck 不集成）。
+- 文档状态：PRD v0.3（D17）；ARCHITECTURE / DATA_MODEL / PROJECT_STRUCTURE 已与代码核实对齐；决策记录至 D18（含 D14 域名归并、D15 容量护栏、D16 cdncheck 不集成、D18 first_synced 语义）。
 - 接口关键事实已于 2026-09-17 对 AGH master 源码 + OpenAPI 与 vendored CFST 源码取证，见 [API.md](API.md) §1.1。
 
 ## 3. references/ 目录的角色（只读，不参与构建）
@@ -25,13 +25,13 @@
 | `references/CloudflareSpeedTest-Adguard-Script-main/` | 社区单域名同步脚本（Go） | AGH 登录 / 旧 user_rules 通道的事实参考，**其方案不采用**（见 [decisions.md](decisions.md) D3） |
 | `references/CloudflareSpeedTest-master/` | CloudflareSpeedTest 源码与发布目录 | 来源 B（**默认来源**，D17）：结果文件格式参考 + 开发期 `result.csv` 真实夹具；MVP 只读取测速结果、不调用其二进制 |
 
-## 4. 下一步（M5–M6：live 写入与验证）
+## 4. 下一步（收尾与实测）
 
 1. ~~定名 + `git init` + `go mod init`~~（已完成）；
 2. ~~`config` 与 `adguard` 客户端（只读）~~（已完成）；
 3. ~~`aggregate` + `detector` 纯函数核心与单测，跑通 dry-run 全链路~~（已完成）；
 4. ~~`ipselector`（默认来源 B：只读 CFST `result.csv`，D17）+ `planner` + `state`~~（已完成）；
-5. `syncer` / `verifier` 落地 live 写入与回查验证（写端点封装、限速重试、逐条结果；通配条目对真实实例的行为需用户授权后实测）；
+5. ~~`syncer` / `verifier` 落地 live 写入与回查验证~~（已完成，httptest 集成测试覆盖；通配条目对真实实例的行为需用户授权后实测）；
 6. 里程碑收尾：用户 `config.yaml` 指向的真实实例做一次只读 dry-run 核对，`--apply` live 验证须用户明确授权。
 
 ## 5. 开放问题（2026-09-17 已全部拍板，详见 [decisions.md](decisions.md) D9~D17）

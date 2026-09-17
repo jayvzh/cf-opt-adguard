@@ -30,6 +30,15 @@ type Stats struct {
 	Fetched int    // 服务端返回条数
 	Kept    int    // 过滤后保留条数
 	Stopped string // StoppedReason 之一
+	Drops   map[string]int // 各过滤环节丢弃计数（kept=0 时用于定位）
+	Newest  time.Time     // 窗口内见到的最新记录时间（kept=0 时判断时钟偏差用）
+}
+
+func (s *Stats) drop(reason string) {
+	if s.Drops == nil {
+		s.Drops = map[string]int{}
+	}
+	s.Drops[reason]++
 }
 
 // Collector 查询日志采集器。
@@ -88,6 +97,7 @@ func (c *Collector) Collect(ctx context.Context, filter *aggregate.DomainFilter)
 		for _, e := range page.Entries {
 			t, err := time.Parse(time.RFC3339Nano, e.Time)
 			if err != nil {
+				st.drop("时间无法解析")
 				c.log.Warn("跳过无法解析时间的记录", "time", e.Time)
 				continue
 			}
@@ -95,20 +105,28 @@ func (c *Collector) Collect(ctx context.Context, filter *aggregate.DomainFilter)
 				earliest = t
 			}
 			st.Fetched++
+			if st.Newest.IsZero() || t.After(st.Newest) {
+				st.Newest = t
+			}
 			if t.Before(windowStart) {
+				st.drop("窗口外")
 				continue // 窗口外仅计数
 			}
 			if e.Question.Type != "A" && e.Question.Type != "AAAA" {
+				st.drop("非A/AAAA类型(" + e.Question.Type + ")")
 				continue // 只消费 A / AAAA（API.md §2.2）
 			}
-			host := aggregate.Normalize(e.Question.Host)
+			host := aggregate.Normalize(e.HostOrName())
 			if host == "" {
+				st.drop("域名归一化为空")
 				continue
 			}
 			if !c.clientAllowed(e.Client) {
+				st.drop("客户端过滤")
 				continue
 			}
 			if filter != nil && !filter.Allow(host) {
+				st.drop("域名黑白名单")
 				continue
 			}
 			out = append(out, aggregate.Entry{Host: host, Client: e.Client, Time: e.Time})

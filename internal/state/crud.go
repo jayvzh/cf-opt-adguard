@@ -168,6 +168,7 @@ func (s *DB) UpsertRewrite(ctx context.Context, r Rewrite) error {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(domain, answer, ip_version) DO UPDATE SET
 			state = excluded.state, agh_present = excluded.agh_present,
+			first_synced = COALESCE(first_synced, excluded.first_synced),
 			last_synced = excluded.last_synced, last_error = excluded.last_error,
 			updated_at = excluded.updated_at`,
 		r.Domain, r.Answer, r.IPVersion, r.State, b2i(r.AGHPresent),

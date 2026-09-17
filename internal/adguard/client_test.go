@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -92,6 +93,48 @@ func TestQueryLogParams(t *testing.T) {
 	}
 	if len(gotQ["reason"]) != 2 {
 		t.Fatalf("reason 应可多值: %v", gotQ["reason"])
+	}
+}
+
+func TestQueryLogLegacyReasonFallback(t *testing.T) {
+	var gotQ url.Values
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		gotQ = r.URL.Query()
+		if gotQ["reason"] != nil && slices.Contains(gotQ["reason"], "NotFilteredAllowList") {
+			// 模拟旧版 AGH：不认识新枚举值，返回 400（报文与真实实例一致）
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`parsing params: reason: bad enum value: "NotFilteredAllowList"`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"oldest":"","data":[]}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "u", "p", AuthBasic, 5*time.Second)
+	params := QueryLogParams{Limit: 10, Reasons: []string{"NotFilteredNotFound", "NotFilteredAllowList"}}
+
+	// 首页：新值 400 → 自动降级旧拼写重试成功
+	if _, err := c.QueryLogPage(context.Background(), params); err != nil {
+		t.Fatalf("降级重试后应成功: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("首次调用应恰好请求 2 次（400+降级重试）, got %d", calls)
+	}
+	if !slices.Contains(gotQ["reason"], "NotFilteredWhiteList") {
+		t.Fatalf("重试应使用旧拼写, got %v", gotQ["reason"])
+	}
+
+	// 次页：降级状态已记住，直接用旧值一次成功
+	if _, err := c.QueryLogPage(context.Background(), params); err != nil {
+		t.Fatalf("次页应直接成功: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("次页应只请求 1 次, got %d", calls)
+	}
+	if slices.Contains(gotQ["reason"], "NotFilteredAllowList") {
+		t.Fatalf("次页不应再发新枚举值, got %v", gotQ["reason"])
 	}
 }
 

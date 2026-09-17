@@ -1,5 +1,6 @@
-// Package adguard 提供 AdGuard Home 只读 HTTP 客户端（querylog / rewrite list / login）。
-// 契约唯一来源 docs/API.md；写接口（rewrite add/update/delete）由 syncer 在第二阶段实现，本包禁止新增写方法。
+// Package adguard 提供 AdGuard Home HTTP 客户端（querylog / rewrite list / login，
+// 以及 rewrite add/update/delete 写端点封装）。
+// 契约唯一来源 docs/API.md；写方法仅可由 internal/syncer 调用（ARCHITECTURE §4.6 唯一写侧）。
 package adguard
 
 import (
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,6 +38,8 @@ type Client struct {
 
 	mu     sync.Mutex
 	cookie *http.Cookie
+
+	legacyReason atomic.Bool // 实例为旧版枚举拼写（降级后置位，进程内记住）
 }
 
 // New 创建客户端。authMode 为空取 AuthBasic。
@@ -55,12 +59,21 @@ func New(baseURL, username, password, authMode string, timeout time.Duration) *C
 // QueryLogEntry 查询日志单条（只定义消费字段，未知字段忽略，API.md §2.2）。
 type QueryLogEntry struct {
 	Question struct {
-		Host string `json:"host"`
+		Host string `json:"host"` // 新版（0.107.32+）域名字段（IDN 解码后）
+		Name string `json:"name"` // 旧版域名字段（zone file 格式），两版均有
 		Type string `json:"type"`
 	} `json:"question"`
 	Reason string `json:"reason"`
 	Client string `json:"client"`
 	Time   string `json:"time"`
+}
+
+// HostOrName 查询域名：新版 host 优先，空则回退旧版 name（pitfalls.md #9）。
+func (e QueryLogEntry) HostOrName() string {
+	if e.Question.Host != "" {
+		return e.Question.Host
+	}
+	return e.Question.Name
 }
 
 // QueryLogPage querylog 单页响应。
@@ -76,8 +89,51 @@ type QueryLogParams struct {
 	Reasons   []string  // 可多次传参，如 NotFilteredNotFound
 }
 
-// QueryLogPage 拉取一页查询日志。
+// reason 枚举随 AGH 版本改名（0.107.x 前后 NotFilteredWhiteList → NotFilteredAllowList），
+// 新值在旧实例上返回 400 实测见 pitfalls.md #8。
+const (
+	reasonAllowNew = "NotFilteredAllowList"
+	reasonAllowOld = "NotFilteredWhiteList"
+)
+
+// downgradeReasons 新枚举替换为旧拼写（其余值两版通用）。
+func downgradeReasons(rs []string) []string {
+	out := make([]string, len(rs))
+	for i, r := range rs {
+		if r == reasonAllowNew {
+			out[i] = reasonAllowOld
+		} else {
+			out[i] = r
+		}
+	}
+	return out
+}
+
+// isReasonEnumErr 服务端 400 且报文中提及新枚举值 → 旧版实例不认识该枚举。
+func isReasonEnumErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "返回 400") && strings.Contains(s, reasonAllowNew)
+}
+
+// QueryLogPage 拉取一页查询日志。reason 枚举跨版本兼容：旧实例不认新值时自动
+// 降级旧拼写重试一次并记住，后续翻页直接使用旧值，避免逐页多打一次失败请求。
 func (c *Client) QueryLogPage(ctx context.Context, p QueryLogParams) (*QueryLogPage, error) {
+	if c.legacyReason.Load() {
+		p.Reasons = downgradeReasons(p.Reasons)
+	}
+	page, err := c.queryLogOnce(ctx, p)
+	if !isReasonEnumErr(err) {
+		return page, err
+	}
+	c.legacyReason.Store(true)
+	p.Reasons = downgradeReasons(p.Reasons)
+	return c.queryLogOnce(ctx, p)
+}
+
+func (c *Client) queryLogOnce(ctx context.Context, p QueryLogParams) (*QueryLogPage, error) {
 	q := url.Values{}
 	if p.Limit > 0 {
 		q.Set("limit", strconv.Itoa(p.Limit))
@@ -111,7 +167,36 @@ func (c *Client) RewriteList(ctx context.Context) ([]RewriteEntry, error) {
 	return entries, nil
 }
 
-// doJSON 执行请求并解析 JSON 响应；cookie 模式遇会话过期允许重登一次重试（仅限本包只读方法，API.md §4）。
+// rewritePayload 写端点请求体的单条目形态（API.md §3；enabled 不主动下发，
+// 由 AGH 默认处理，避免误启用用户手动停用的条目）。
+type rewritePayload struct {
+	Domain string `json:"domain"`
+	Answer string `json:"answer"`
+}
+
+// RewriteAdd 新增重写条目（写端点，仅 syncer 调用）。
+func (c *Client) RewriteAdd(ctx context.Context, domain, answer string) error {
+	return c.doJSON(ctx, http.MethodPost, "/control/rewrite/add", nil,
+		rewritePayload{Domain: domain, Answer: answer}, nil)
+}
+
+// RewriteUpdate 按 target 精确修改单条（写端点，仅 syncer 调用）。
+func (c *Client) RewriteUpdate(ctx context.Context, domain, oldAnswer, newAnswer string) error {
+	body := map[string]rewritePayload{
+		"target": {Domain: domain, Answer: oldAnswer},
+		"update": {Domain: domain, Answer: newAnswer},
+	}
+	return c.doJSON(ctx, http.MethodPost, "/control/rewrite/update", nil, body, nil)
+}
+
+// RewriteDelete 删除单条（写端点，仅 syncer 调用）。
+func (c *Client) RewriteDelete(ctx context.Context, domain, answer string) error {
+	return c.doJSON(ctx, http.MethodPost, "/control/rewrite/delete", nil,
+		rewritePayload{Domain: domain, Answer: answer}, nil)
+}
+
+// doJSON 执行请求并解析 JSON 响应；cookie 模式遇 401（会话过期）允许重登一次后重放原请求
+//（写请求 401 意味着未被执行，重放安全；403 认证失败不重试，API.md §4）。
 func (c *Client) doJSON(ctx context.Context, method, path string, q url.Values, body, out any) error {
 	err := c.doOnce(ctx, method, path, q, body, out)
 	if err == nil || !errors.Is(err, ErrAuth) || c.authMode != AuthCookie {

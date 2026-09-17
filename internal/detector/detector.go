@@ -63,13 +63,15 @@ func Classify(score, threshold int) aggregate.Verdict {
 	}
 }
 
-// Result 单域名探测结论（信号逐项保留，落库可追溯）。
+// Result 单域名探测结论（信号与解析证据逐项保留，落库可追溯）。
 type Result struct {
 	Host    string
 	Verdict aggregate.Verdict
 	Score   int
 	Signal  Signal
-	Err     string // DNS 解析失败原因（此时 verdict 恒 not_cf）
+	IPs     []net.IP // 最终解析到的 A 记录（DNS 失败时为空）
+	CNAMEs  []string // CNAME 链（按跳序；DNS 失败时为已获取部分之外的空）
+	Err     string   // DNS 解析失败原因（此时 verdict 恒 not_cf）
 }
 
 // Detector 探测器。并发安全（CIDR 列表加载后只读）。
@@ -131,12 +133,14 @@ func (d *Detector) DetectAll(ctx context.Context, hosts []string) []Result {
 // Detect 探测单域名（DNS 失败 → not_cf；HTTP 失败 → 信号缺失）。
 func (d *Detector) Detect(ctx context.Context, host string) Result {
 	res := Result{Host: host}
-	ips, cnameCF, err := d.resolveChain(ctx, host)
+	ips, chain, cnameCF, err := d.resolveChain(ctx, host)
 	if err != nil {
 		res.Err = err.Error()
 		res.Verdict = aggregate.VerdictNotCF
 		return res
 	}
+	res.IPs = ips
+	res.CNAMEs = chain
 	sig := Signal{CNAMECF: cnameCF}
 	for _, ip := range ips {
 		if d.inCF(ip) {
@@ -154,14 +158,15 @@ func (d *Detector) Detect(ctx context.Context, host string) Result {
 }
 
 // resolveChain 从独立 resolver 追 CNAME 链并收集最终 A 记录。
-func (d *Detector) resolveChain(ctx context.Context, host string) ([]net.IP, bool, error) {
+func (d *Detector) resolveChain(ctx context.Context, host string) ([]net.IP, []string, bool, error) {
 	var ips []net.IP
+	var chain []string
 	cnameCF := false
 	current := strings.ToLower(strings.TrimSuffix(host, "."))
 	for hop := 0; hop < maxCNAMEDepth; hop++ {
 		msg, err := d.exchange(ctx, current, dns.TypeA)
 		if err != nil {
-			return nil, false, err
+			return nil, chain, cnameCF, err
 		}
 		gotIP := false
 		next := ""
@@ -169,6 +174,7 @@ func (d *Detector) resolveChain(ctx context.Context, host string) ([]net.IP, boo
 			switch rr := a.(type) {
 			case *dns.CNAME:
 				t := strings.ToLower(strings.TrimSuffix(rr.Target, "."))
+				chain = append(chain, t)
 				if isCFCNAME(t) {
 					cnameCF = true
 				}
@@ -181,11 +187,11 @@ func (d *Detector) resolveChain(ctx context.Context, host string) ([]net.IP, boo
 			}
 		}
 		if gotIP || next == "" {
-			return ips, cnameCF, nil
+			return ips, chain, cnameCF, nil
 		}
 		current = next
 	}
-	return ips, cnameCF, nil
+	return ips, chain, cnameCF, nil
 }
 
 // exchange 依次尝试全部 resolver，取第一个成功应答（NOERROR）。

@@ -44,6 +44,8 @@
 
 采集器策略（P0 仅新版，D11）：用 `reason=NotFilteredNotFound`（可再加 `NotFilteredAllowList`）取正常放行记录，`limit` + `older_than` 向前翻页直至覆盖时间窗口；不实现旧版 `startTime/endTime` 与 `response_status` 降级路径。参数集合格式化只在 `adguard` 客户端一处维护；开工后以用户 `config.yaml` 指向的实例只读实测，把下表字段与响应结构固化回填。
 
+> **版本兼容（2026-09-18 真实实例实测，见 pitfalls.md #8）**：`NotFilteredAllowList` 为新版拼写，旧实例（0.107.x 改名前）只认 `NotFilteredWhiteList` 并对新值返回 400。客户端已自动降级重试，无需用户配置。
+
 ### 2.2 响应（关键字段，以实测为准）
 
 ```json
@@ -51,7 +53,7 @@
   "oldest": "2026-09-10T00:00:00Z",
   "data": [
     {
-      "question": { "host": "assets.example.com", "type": "A", "class": "IN" },
+      "question": { "host": "assets.example.com", "name": "assets.example.com", "type": "A", "class": "IN" },
       "answer": [
         { "type": "A", "value": "104.16.1.2", "ttl": 60, "name": "assets.example.com" }
       ],
@@ -66,7 +68,7 @@
 
 消费约定：
 
-- 只消费 `question.host` / `question.type`（A、AAAA）/ `reason` / `client` / `time`；
+- 只消费 `question.host`（或旧版 `question.name`，两版兼容见 [pitfalls.md](pitfalls.md) 第 9 条）/ `question.type`（A、AAAA）/ `reason` / `client` / `time`；
 - `answer` 不作为 CF 判定依据（它可能已被本工具的重写污染，判定一律走 detector 独立解析）；
 - 未知字段一律忽略，保证对 AGH 版本演进向前兼容。
 
@@ -128,13 +130,13 @@ IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区�
 
 ## 7. CLI 契约（本工具对外接口）
 
-> 设计稿，实现后以 `cf-opt-adguard --help` 实测回填；flags 与 [DATA_MODEL.md](DATA_MODEL.md) §4 配置键一一对应。
+> 已实现；实际 flags 以 `cf-opt-adguard --help` 实测为准，flags 与 [DATA_MODEL.md](DATA_MODEL.md) §4 配置键一一对应。
 
 ### 7.1 子命令
 
 | 命令 | 说明 |
 | --- | --- |
-| `run` | 执行一次完整流水线（核心命令；M1–M4 仅 dry-run，`--apply` 属 M5–M6） |
+| `run` | 执行一次完整流水线（核心命令；默认 dry-run，显式 `--apply` live 写入） |
 | `export` | 从状态库导出 `domains.csv` / `rewrites.csv`（`-o` 指定输出目录，只读） |
 | `version` | 打印版本 |
 
@@ -153,7 +155,7 @@ cf-opt-adguard run \
   --db-path ./data/state.db \
   --log-level info
 
-# 核对计划无误后，显式 --apply 才真正写入（M5–M6 前传入恒报错，退出码 2）
+# 核对计划无误后，显式 --apply 才真正写入
 cf-opt-adguard run -c config.yaml --apply
 
 # 状态库导出查看
@@ -164,7 +166,7 @@ cf-opt-adguard export -c config.yaml -o ./out
 - **默认 dry 模式**：只产出计划，绝不调写接口；显式 `--apply` 进入 live 模式执行写入（D10）。cron / systemd timer 任务必须显式带 `--apply`。
 - 计划输出固定包含：采集条数、候选数、confirmed 数、优选 IP、add/update/remove 计数与逐条 `domain → answer` 清单，以及 `[DRY-RUN]` / `[APPLY]` 模式标识。
 
-### 7.3 退出码（计划）
+### 7.3 退出码（已实现并启用）
 
 | 码 | 含义 |
 | --- | --- |

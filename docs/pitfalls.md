@@ -1,7 +1,7 @@
 # 踩坑与绕开姿势（pitfalls.md）
 
 > 格式：标题 + 现象 / 原因 / 解决 / 备注。只收非显而易见、可能再踩的坑；通用常识不写。
-> M1–M4 已实现（对真实 AGH 实例的 live 联调尚未开始），以下条目来自官方源码 / 参考仓库的**一手取证**（非实跑踩坑），M5–M6 联调时必须逐条复核并补充实测现象。
+> M1–M6 代码已实现（对真实 AGH 实例的 live 联调尚未开始），以下条目来自官方源码 / 参考仓库的**一手取证**（非实跑踩坑），真实实例联调时必须逐条复核并补充实测现象。
 > 更新时机：实测与文档不一致、踩了新坑时。
 
 ---
@@ -53,3 +53,17 @@
 - **现象**：参考仓库的 `config.yaml` 直接写明 `username/password: admin/admin`。
 - **风险**：照抄习惯会把 AGH 凭据提交进库。
 - **解决**：仓库只提供 `config.example.yaml`；真实 `config.yaml` 加入忽略（git init 时配 `.gitignore`）；支持 `${ENV_VAR}` 展开从环境取密码；日志对密码与 Cookie 脱敏。
+
+## 8. querylog `reason` 枚举跨版本改名，旧实例对 `NotFilteredAllowList` 返回 400（真实实例实测）
+
+- **现象**（2026-09-18 用户真实 AGH 实例）：`GET /control/querylog?reason=NotFilteredAllowList` 返回 `400: parsing params: reason: bad enum value: "NotFilteredAllowList"`。
+- **原因**：AGH 0.107.x 某版本把白名单措辞 whitelist → allowlist，`NotFilteredWhiteList` 改名 `NotFilteredAllowList`；master 取证（API.md §1.1）只覆盖新拼写，旧实例枚举校验直接拒绝，整页 400。
+- **解决**：`adguard.Client` 检测"400 且报文含 `NotFilteredAllowList`"后，自动把该值降级为 `NotFilteredWhiteList` 重试一次，并在进程内记住（后续翻页直接用旧值，不逐页多打失败请求）；已由 `TestQueryLogLegacyReasonFallback` 覆盖。
+- **备注**：两版实例对 `NotFilteredNotFound` 均接受，无需处理；若未来枚举再变，同样走"400 + 报文回显值"降级模式。
+
+## 9. querylog `question` 域名字段跨版本不同：旧版 `name`、新版 `host`（真实实例实测）
+
+- **现象**（2026-09-18 用户真实 AGH 实例）：修复 #8 后采集 `fetched=2500 kept=0`，丢弃分布显示窗口内记录 100% 因"域名归一化为空"被丢弃。
+- **原因**：取证旧版源码（v0.107.31 `internal/querylog/json.go`）发现 `entryToJSON` 构造的 `question` 对象只有 `type` / `class` / `name` 三个字段，**没有 `host`**；`host` 是新版（whitelist → allowlist 改名同期）引入的 IDN 解码字段。旧实例按 `json:"host"` 解析得到空串，Normalize 后为空全部丢弃；而 `question.type` 两版都有，类型过滤不受影响，掩盖了字段缺失。
+- **解决**：`QueryLogEntry.Question` 同时声明 `Host` 与 `Name`，`HostOrName()` 方法新版 `host` 优先、空则回退旧版 `name`；测试夹具改为真实旧版格式（仅 `name`），并保留一条新版 `host` 条目覆盖优先级。
+- **教训**：对同一 JSON 对象的"消费字段"做跨版本取证时，要逐字段确认存在性，不能假设 master 的字段集在旧版同样齐全——**枚举值缺失会显式报错（400），而普通字段缺失只会静默解出空串**，必须靠丢弃分布这类统计才能暴露。

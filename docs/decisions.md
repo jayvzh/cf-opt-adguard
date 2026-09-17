@@ -127,3 +127,12 @@
   3. **MVP 不实现自动测速**：不 exec / 拉起 `cfst` 二进制，不拼测速参数；自动调用测速 / 定时调度测速仍为 P1（PRD §5.2）。
 - **原因**：同目录部署使默认路径零配置；读 CSV 是稳定、可离线夹具测试的外部契约；自动测速与本工具核心链路解耦，推迟不影响 MVP 价值。
 - **影响**：部分修订 D8；PRD F4 / §6、ARCHITECTURE §3 / §4.4、API §6 / §7.2、DATA_MODEL §4（`cfip.source` 默认值）同步；`config.Default()` 的 `cfip.source` 需在实现时设为 `cfst:result.csv`；`result.csv` 缺失 / 只有表头仍按"优选 IP 为空"安全中止（退出码 2，不写不删）；开发期以 `references/` 下真实 `result.csv` 作只读夹具，拷贝进各包 `testdata/` 使用。
+
+## D18 ｜ 2026-09-18 ｜ first_synced 只由首次成功写入填定，此后不变（COALESCE + markSynced 双层保障）
+
+- **背景**：live 写入落地时发现：persist 先建 pending 行（`first_synced=NULL`），syncer 成功后 UpsertRewrite 冲突分支若直接覆盖会把"首次同步成功时间"冲掉，违背审计语义。
+- **决策**：
+  1. `state.UpsertRewrite` 冲突分支用 `first_synced = COALESCE(first_synced, excluded.first_synced)`——已有值永不覆盖，仅空值时落入新值；
+  2. `syncer.markSynced` 在 `rw.FirstSynced.IsZero()` 时补当前时间后一并落库，双层兜底。
+- **原因**：`first_synced` 是"该答案首次真正写入 AGH"的审计锚点（容量护栏 / 排障时间线依赖它），必须单调不可变；`last_synced` 承担"最近一次成功"语义，两者职责分离。
+- **影响**：ARCHITECTURE §4.6 已同步该语义；removed 行归档保留（审计不清除）不受影响；无迁移变更（列早已存在）。

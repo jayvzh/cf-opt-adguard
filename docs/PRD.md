@@ -1,6 +1,6 @@
 # cf-opt-adguard 产品需求文档（PRD.md）
 
-> 版本：v0.3 ｜ 状态：M1–M4（dry-run 全链路）已实现，`syncer` / `verifier` 属 M5–M6 待建（2026-09-17）。v0.3：F4 优选 IP 默认来源改为 CloudflareSpeedTest 结果文件（D17）；F2 / §6 聚合默认改为 zone 混合归并（D14）。
+> 版本：v0.3 ｜ 状态：M1–M6（dry-run + `--apply` live 写入与验证）已实现（2026-09-18）。v0.3：F4 优选 IP 默认来源改为 CloudflareSpeedTest 结果文件（D17）；F2 / §6 聚合默认改为 zone 混合归并（D14）。
 > 本文只回答：做什么、为谁做、不做什么、业务规则。技术实现见 [ARCHITECTURE.md](ARCHITECTURE.md)，接口字段见 [API.md](API.md)。
 > 相关：[ARCHITECTURE.md](ARCHITECTURE.md)、[API.md](API.md)、[decisions.md](decisions.md)。
 > 更新时机：需求范围、功能优先级、业务默认值发生变化时（同步检查架构文档是否受影响）。

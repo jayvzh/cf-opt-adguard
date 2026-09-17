@@ -1,5 +1,6 @@
 // cf-opt-adguard：AdGuard Home 的 Cloudflare rewrite 外部编排器。
-// 本版本（M1–M4）仅支持 dry-run：只读采集 + 计划打印，绝不调用 AGH 写端点。
+// 默认 dry-run（只读 + 计划打印）；--apply 进入 live 模式，
+// 由 syncer 作为唯一写侧执行计划并经 AGH DNS 回查验证。
 package main
 
 import (
@@ -53,7 +54,7 @@ func run(args []string) int {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprint(w, `cf-opt-adguard — AdGuard Home 的 Cloudflare rewrite 外部编排器（M1–M4 dry-run）
+	fmt.Fprint(w, `cf-opt-adguard — AdGuard Home 的 Cloudflare rewrite 外部编排器
 
 用法:
   cf-opt-adguard run     [flags]   执行一次完整流水线（默认 dry-run，只读 + 计划打印）
@@ -61,7 +62,8 @@ func usage(w io.Writer) {
   cf-opt-adguard version           打印版本
   cf-opt-adguard help              本帮助
 
-本版本绝不调用 AdGuard Home 写端点；--apply 属第二阶段（syncer, M5–M6）。
+dry-run 绝不调用 AdGuard Home 写端点；--apply 为 live 写入（syncer 唯一写侧，
+部分失败退出码 4），写入后经 AGH DNS 回查验证。
 `)
 }
 
@@ -77,7 +79,7 @@ func cmdRun(args []string) int {
 	window := fs.String("window", "", "覆盖 querylog.window（如 24h / 7d / 30d）")
 	minHits := fs.Int("min-hits", 0, "覆盖聚合命中阈值（同时作用于 24h 与 7d 档）")
 	cfipSource := fs.String("cfip-source", "", "覆盖 cfip.source（默认 cfst:result.csv，D17）")
-	apply := fs.Bool("apply", false, "进入 live 模式（本版本未实现，恒报错退出）")
+	apply := fs.Bool("apply", false, "进入 live 模式：执行计划写入 AGH 并回查验证（默认 dry-run）")
 	logLevel := fs.String("log-level", "", "覆盖 runtime.log_level")
 	dbPath := fs.String("db-path", "", "覆盖 runtime.db_path")
 	if err := fs.Parse(args); err != nil {
@@ -103,12 +105,11 @@ func cmdRun(args []string) int {
 		fmt.Fprintln(os.Stderr, "配置错误:", err)
 		return pipeline.ExitNoIP
 	}
-	if cfg.Runtime.Apply {
-		fmt.Fprintln(os.Stderr, "--apply 需要第二阶段 syncer（M5–M6），本版本仅支持 dry-run（退出码 2）")
-		return pipeline.ExitNoIP
-	}
 
 	log := newLogger(cfg.Runtime.LogLevel, cfg.Runtime.LogFile)
+	if cfg.Runtime.Apply {
+		log.Warn("live 模式：将执行计划写入 AdGuard Home（syncer 唯一写侧）")
+	}
 	// 确保状态库目录存在（首次运行 ./data 不存在时 sqlite 无法自行建目录）。
 	if dir := filepath.Dir(cfg.Runtime.DBPath); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {

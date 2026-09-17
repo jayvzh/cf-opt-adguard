@@ -15,10 +15,10 @@ import (
 	"cf-opt-adguard/internal/config"
 )
 
-// qlogEntry 构造 AGH querylog 记录的最小 JSON。
+// qlogEntry 构造 AGH querylog 记录的最小 JSON（旧版格式：域名在 question.name）。
 func qlogEntry(host, qtype, client, at string) map[string]any {
 	return map[string]any{
-		"question": map[string]string{"host": host, "type": qtype, "class": "IN"},
+		"question": map[string]string{"name": host, "type": qtype, "class": "IN"},
 		"reason":   "NotFilteredNotFound",
 		"client":   client,
 		"time":     at,
@@ -167,6 +167,58 @@ func TestCollectFilters(t *testing.T) {
 		if e.Host == "other.org" || e.Host == "drop.corp" {
 			t.Fatalf("不该保留 %s", e.Host)
 		}
+	}
+}
+
+func TestCollectDropsTracking(t *testing.T) {
+	now := time.Now().UTC()
+	inWin := now.Add(-time.Minute).Format(time.RFC3339Nano)
+	outWin := now.Add(-30 * time.Hour).Format(time.RFC3339Nano)
+
+	fake := &fakeAGH{pages: [][]map[string]any{{
+		qlogEntry("bad.time.example.com", "A", "10.0.0.1", "not-a-time"),     // 时间无法解析（不计入 Fetched）
+		qlogEntry("old.example.com", "A", "10.0.0.1", outWin),                // 窗口外
+		qlogEntry("cname.example.com", "CNAME", "10.0.0.1", inWin),           // 非 A/AAAA 类型
+		qlogEntry("", "A", "10.0.0.1", inWin),                                // 域名归一化为空
+		qlogEntry("drop.example.com", "A", "10.9.9.9", inWin),                // 客户端过滤
+		qlogEntry("drop.corp", "A", "10.0.0.1", inWin),                       // 域名黑白名单
+		qlogEntry("keep.example.com", "AAAA", "10.0.0.1", inWin),             // 保留（旧版 name 字段）
+	}}}
+	// 新版格式（host 优先于 name）也应保留
+	newFmt := qlogEntry("keep.example.com", "AAAA", "10.0.0.1", inWin)
+	newFmt["question"] = map[string]string{"host": "keep.example.com", "name": "", "type": "AAAA", "class": "IN"}
+	fake.pages[0] = append(fake.pages[0], newFmt)
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer srv.Close()
+
+	c, _ := newTestCollector(t, srv.URL, func(cc *config.Config) {
+		cc.QueryLog.Window = "24h"
+		cc.QueryLog.ClientsExclude = []string{"10.9.9.9"}
+	})
+	filter := aggregate.NewDomainFilter(nil, []string{"*.corp"})
+	_, st, err := c.Collect(context.Background(), filter)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	want := map[string]int{
+		"时间无法解析":    1,
+		"窗口外":        1,
+		"非A/AAAA类型(CNAME)": 1,
+		"域名归一化为空":   1,
+		"客户端过滤":     1,
+		"域名黑白名单":    1,
+	}
+	if len(st.Drops) != len(want) {
+		t.Fatalf("丢弃原因种类应 %d 种, got %d: %v", len(want), len(st.Drops), st.Drops)
+	}
+	for k, n := range want {
+		if st.Drops[k] != n {
+			t.Fatalf("丢弃 %s 应 %d 次, got %d: %v", k, n, st.Drops[k], st.Drops)
+		}
+	}
+	// Fetched 只计时间可解析的条目：8 条夹具 - 1 条时间非法 = 7
+	if st.Fetched != 7 || st.Kept != 2 {
+		t.Fatalf("Fetched 应 7 / Kept 应 2, got %d / %d", st.Fetched, st.Kept)
 	}
 }
 
