@@ -29,3 +29,6 @@ config.yaml
 data/
 *.db
 /result*.csv
+
+# 发布产物
+/release/

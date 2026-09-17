@@ -28,7 +28,8 @@ cf-opt-adguard/
 │   ├── state/                   # 已实现：SQLite 仓储、迁移（migrations/0001_init.sql 定稿）、容量护栏（D15）
 │   └── (notify/ P1 再建，MVP 不允许出现)
 ├── config.example.yaml          # 已实现：配置模板（不含真实密码，D17 已同步）
-├── scripts/                     # 按需建立：构建 / 发布辅助（非必需不预置）
+├── scripts/                     # 已实现：build-release.sh（双架构构建+打包）/ install.sh（多菜单安装管理）
+├── release/                     # 构建产物目录（git 忽略）：*.tar.gz + checksums.txt
 ├── docs/                        # 本目录
 ├── references/                  # 只读参考材料（规范、上游样例、CFST 源码），不参与构建
 └── README.md
