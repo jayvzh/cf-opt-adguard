@@ -9,12 +9,17 @@ SERVICE_NAME="cf-opt-adguard"
 DEFAULT_INSTALL_DIR="/opt/cf-opt-adguard"
 # GitHub releases 拉取基址（构建时 build-release.sh 会重新注入；此处为兜底默认）。
 DEFAULT_RELEASE_BASE_URL="https://github.com/jayvzh/cf-opt-adguard/releases/latest/download"
+# 脚本自身的规范获取地址（用于提示与 curl|bash 场景）。
+SCRIPT_URL="https://github.com/jayvzh/cf-opt-adguard/raw/refs/heads/main/scripts/install.sh"
+# CloudflareSpeedTest 官方最新发布（资产名 cfst_linux_<arch>.tar.gz，内含 cfst 二进制）。
+CFST_RELEASE_BASE="https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download"
 
 action=""
 arch=""
 install_dir=""
 arg_url=""          # --url 覆盖拉取基址
 skip_schedule=false
+with_cfst=false     # --with-cfst：安装时自动拉取 cfst 依赖
 
 # 交互答案（parse_args 可预置，do_install 中逐项补默认）
 agh_url=""; agh_user=""; agh_pass=""
@@ -42,6 +47,14 @@ detect_env() {
 
 is_root() { [ "$(id -u)" = "0" ]; }
 
+require_cmds() {
+    local miss="" c
+    for c in curl tar; do command -v "$c" >/dev/null 2>&1 || miss="$miss $c"; done
+    if [ -n "$miss" ]; then
+        _red "缺少必要命令:$miss，请先安装后再运行本脚本。"; exit 1
+    fi
+}
+
 release_base_url() {
     if [ -n "$arg_url" ]; then echo "$arg_url"; return; fi
     echo "$DEFAULT_RELEASE_BASE_URL"
@@ -51,22 +64,24 @@ release_base_url() {
 # 获取二进制：本地二进制 > 本地 tar.gz > 远程拉取
 ########################################
 fetch_binary() {
-    local dest_dir="$1" src tarball
-    local script_dir
-    script_dir=$(cd "$(dirname "$0")" && pwd)
+    local dest_dir="$1" src tarball script_dir
+    script_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || script_dir=""
 
-    if [ -x "$script_dir/cf-opt-adguard" ]; then
-        src="$script_dir/cf-opt-adguard"
-        _blue "使用同目录二进制: $src"
-        cp "$src" "$dest_dir/cf-opt-adguard"
-        return 0
-    fi
+    # 管道执行（bash <(curl ...)）时 $0 类似 /dev/fd/63，直接跳过本地探测走远程。
+    if [ -n "$script_dir" ] && [ -d "$script_dir" ] && [[ "$script_dir" != /dev/fd/* ]]; then
+        if [ -x "$script_dir/cf-opt-adguard" ]; then
+            src="$script_dir/cf-opt-adguard"
+            _blue "使用同目录二进制: $src"
+            cp "$src" "$dest_dir/cf-opt-adguard"
+            return 0
+        fi
 
-    tarball=$(ls "$script_dir"/cf-opt-adguard-*-linux-*.tar.gz 2>/dev/null | head -n1 || true)
-    if [ -n "$tarball" ]; then
-        _blue "使用同目录发布包: $tarball"
-        tar -xzf "$tarball" -C "$dest_dir" --strip-components=1 cf-opt-adguard*-linux-*/cf-opt-adguard
-        return 0
+        tarball=$(ls "$script_dir"/cf-opt-adguard-*-linux-*.tar.gz 2>/dev/null | head -n1 || true)
+        if [ -n "$tarball" ]; then
+            _blue "使用同目录发布包: $tarball"
+            tar -xzf "$tarball" -C "$dest_dir" --strip-components=1 cf-opt-adguard*-linux-*/cf-opt-adguard
+            return 0
+        fi
     fi
 
     local base; base=$(release_base_url)
@@ -75,16 +90,59 @@ fetch_binary() {
         _yellow "请把发布 tar.gz 或解压后的二进制与本脚本放同一目录，或用 --url 指定拉取基址。"
         exit 1
     fi
-    local repo_root="${base%%/releases*}"
-    local tag
-    tag=$(curl -sI "$repo_root/releases/latest" | sed -n 's#.*tag/\(.*\)\r#\1#p')
-    if [ -z "$tag" ]; then _red "获取最新版本号失败: $repo_root"; exit 1; fi
+    # 跟随 /releases/latest 重定向取真实 tag，拼出确定资产名。
+    local repo_root latest tag
+    repo_root="${base%/releases/*}"
+    latest=$(curl -fsS -o /dev/null -w '%{redirect_url}' "$repo_root/releases/latest" || true)
+    tag=${latest##*/}
+    if [ -z "$tag" ]; then
+        _red "获取最新版本号失败（GitHub 不可达或尚无 Release）: $repo_root/releases/latest"
+        exit 1
+    fi
     tarball="cf-opt-adguard-${tag}-linux-${arch}.tar.gz"
     _blue "拉取发布包: $base/$tarball"
     curl -fL "$base/$tarball" -o "$dest_dir/$tarball"
     tar -xzf "$dest_dir/$tarball" -C "$dest_dir" --strip-components=1 \
         "cf-opt-adguard-${tag}-linux-${arch}/cf-opt-adguard"
     rm -f "$dest_dir/$tarball"
+}
+
+########################################
+# CloudflareSpeedTest 依赖：从官方 Release 拉取最新版解包到 cfst 目录
+########################################
+fetch_cfst() {
+    local dir="$1" tmp url
+    mkdir -p "$dir"
+    url="$CFST_RELEASE_BASE/cfst_linux_${arch}.tar.gz"
+    _blue "==> 拉取 CloudflareSpeedTest 最新版（linux/${arch}）"
+    tmp=$(mktemp -d)
+    if ! curl -fL --retry 2 "$url" -o "$tmp/cfst.tar.gz"; then
+        _red "cfst 下载失败: $url"; rm -rf "$tmp"; return 1
+    fi
+    # 包内顶层目录为 cfst_linux_<arch>/，strip 一层落到 cfst 目录（含 cfst/ip.txt/ipv6.txt）。
+    tar -xzf "$tmp/cfst.tar.gz" -C "$dir" --strip-components=1
+    rm -rf "$tmp"
+    chmod +x "$dir/cfst"
+    if [ ! -x "$dir/cfst" ]; then
+        _red "cfst 解包后未找到可执行文件: $dir/cfst"; return 1
+    fi
+    _green "[ok] cfst 已就绪: $dir/cfst"
+}
+
+# 安装向导收尾阶段：cfst 缺失时按模式自动/询问拉取。
+ensure_cfst() {
+    [ -x "$cfst_dir/cfst" ] && return 0
+    if [ "$with_cfst" = true ]; then
+        fetch_cfst "$cfst_dir"
+    elif [ -t 0 ]; then
+        local _c="y"
+        read -rp "未检测到 $cfst_dir/cfst，是否自动下载 CloudflareSpeedTest 最新版？(Y/n): " _c || _c="n"
+        if [ "${_c:-y}" = "y" ]; then fetch_cfst "$cfst_dir"; else
+            _yellow "已跳过；稍后可用管理菜单「安装/更新 CloudflareSpeedTest」补装。"
+        fi
+    else
+        _yellow "未检测到 $cfst_dir/cfst；非交互模式可加 --with-cfst 自动下载。"
+    fi
 }
 
 ########################################
@@ -108,7 +166,7 @@ ask_defaults() {
     agh_user=${agh_user:-${AGH_USER:-admin}}
     agh_pass=${agh_pass:-${AGH_PASS:-}}
     window=${window:-${WINDOW:-7d}}
-    min_hits=${min_hits:-${MIN_HITS:-20}}
+    min_hits=${min_hits:-${MIN_HITS:-10}}
     interval_days=${interval_days:-${INTERVAL_DAYS:-0}}
     interval_hours=${interval_hours:-${INTERVAL_HOURS:-12}}
     cfst_dir=${cfst_dir:-${CFST_DIR:-$install_dir/cfst}}
@@ -157,7 +215,6 @@ validate_answers() {
     if [ $((interval_days * 24 + interval_hours)) -lt 1 ]; then
         _red "运行间隔至少 1 小时"; exit 1
     fi
-    [ -x "$cfst_dir/cfst" ] || _yellow "警告: $cfst_dir/cfst 不存在或不可执行，请先下载 CloudflareSpeedTest 到该目录"
 }
 
 total_hours() { echo $((interval_days * 24 + interval_hours)); }
@@ -271,7 +328,7 @@ EOF
 install_schedule() {
     [ "$skip_schedule" = true ] && { _yellow "已跳过定时任务安装（--skip-schedule）"; return 0; }
     if ! is_root; then
-        _yellow "非 root，无法安装定时任务；可稍后手动执行: sudo bash $0 toggle"; return 0
+        _yellow "非 root，无法安装定时任务；装好后可重新运行本脚本（菜单 4）或执行: sudo bash <(curl -sL $SCRIPT_URL)"; return 0
     fi
     if [ "$SYSTEMD" = 1 ]; then install_schedule_systemd; else install_schedule_cron; fi
 }
@@ -382,6 +439,7 @@ do_install() {
     save_settings
     gen_config
     gen_wrapper
+    ensure_cfst
     install_schedule
 
     echo
@@ -414,6 +472,7 @@ do_reconfig() {
     save_settings
     gen_config
     gen_wrapper
+    ensure_cfst
     if [ "$skip_schedule" != true ]; then remove_schedule; install_schedule; fi
     _green "✅ 配置已更新并重载定时任务"
 }
@@ -478,6 +537,14 @@ do_update() {
     _green "✅ 更新完成: $("$install_dir/cf-opt-adguard" version)"
 }
 
+do_install_cfst() {
+    install_dir=${install_dir:-$DEFAULT_INSTALL_DIR}
+    [ -f "$(settings_file)" ] && load_settings
+    ask_defaults
+    cfst_dir=${cfst_dir:-$install_dir/cfst}
+    fetch_cfst "$cfst_dir"
+}
+
 do_uninstall() {
     install_dir=${install_dir:-$DEFAULT_INSTALL_DIR}
     remove_schedule
@@ -503,8 +570,9 @@ menu() {
     echo "3. 修改配置（AGH/窗口/频次/间隔等）"
     echo "4. 启用 / 暂停 定时任务"
     echo "5. 查看状态与最近日志"
-    echo "6. 更新二进制"
-    echo "7. 卸载"
+    echo "6. 更新主程序二进制"
+    echo "7. 安装 / 更新 CloudflareSpeedTest 依赖"
+    echo "8. 卸载"
     echo
     echo "0. 退出"
     echo
@@ -516,7 +584,8 @@ menu() {
         4) action="toggle" ;;
         5) action="status" ;;
         6) action="update" ;;
-        7) action="uninstall" ;;
+        7) action="install-cfst" ;;
+        8) action="uninstall" ;;
         0) exit 0 ;;
         *) return ;;
     esac
@@ -545,6 +614,7 @@ parse_args() {
             --install-dir) install_dir="$2"; shift 2 ;;
             --url)         arg_url="$2"; shift 2 ;;
             --skip-schedule) skip_schedule=true; shift ;;
+            --with-cfst)   with_cfst=true; shift ;;
             *) _red "未知参数: $1"; exit 1 ;;
         esac
     done
@@ -558,6 +628,7 @@ dispatch() {
         toggle)    do_toggle ;;
         status)    do_status ;;
         update)    do_update ;;
+        install-cfst) do_install_cfst ;;
         uninstall) do_uninstall ;;
         *) usage ;;
     esac
@@ -574,7 +645,8 @@ Commands:
   reconfig    修改配置并重载定时任务
   toggle      启用 / 暂停 定时任务
   status      查看版本 / 定时状态 / 最近日志
-  update      更新二进制（保留配置与日志）
+  update       更新主程序二进制（保留配置与日志）
+  install-cfst 安装 / 更新 CloudflareSpeedTest 到 cfst 目录
   uninstall   卸载（移除定时任务并删除安装目录）
   help        本帮助
 
@@ -583,7 +655,7 @@ Options:
   --agh-user <user>      AGH 用户名（默认 admin）
   --agh-pass <pass>      AGH 密码
   --window <w>           统计窗口 24h/7d/30d/2w（默认 7d）
-  --min-hits <n>         点击频次阈值（默认 20）
+  --min-hits <n>         点击频次阈值（默认 10）
   --interval "<d h>"     运行间隔，天数 小时（如 "0 6"=每6小时, "1 0"=每天；默认 "0 12"）
   --cfst-dir <dir>       CFST 目录（默认 <安装目录>/cfst）
   --cfst-cmd <cmd>       CFST 命令（默认 "./cfst -tl 200 -dn 20"）
@@ -591,6 +663,7 @@ Options:
   --install-dir <dir>    安装目录（默认 /opt/cf-opt-adguard）
   --url <base>           发布包拉取基址（.../releases/latest/download）
   --skip-schedule        只落文件不装定时任务（测试用）
+  --with-cfst            安装时自动拉取 CloudflareSpeedTest 最新版到 cfst 目录
 
 示例:
   sudo bash install.sh                        # 交互菜单
@@ -600,10 +673,20 @@ EOF
 }
 
 detect_env
+require_cmds
 if [ $# -gt 0 ]; then
     parse_args "$@"
     dispatch "$action"
 else
+    # curl|bash 直管道时 stdin 被下载流占用，无法回答向导，必须引导到进程替换形式。
+    if [ ! -t 0 ]; then
+        _red "交互式菜单需要终端输入，当前标准输入不是 TTY（可能用了 curl|bash 直管道）。"
+        _yellow "请改用进程替换形式（注意是 <(...) 不是 |）:"
+        echo "    bash <(curl -sL $SCRIPT_URL)"
+        echo "  或先下载再执行:"
+        echo "    curl -sL $SCRIPT_URL -o /tmp/cf-opt-install.sh && sudo bash /tmp/cf-opt-install.sh"
+        exit 1
+    fi
     while true; do
         menu
     done

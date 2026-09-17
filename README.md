@@ -22,23 +22,10 @@ AGH 查询日志 → 采集 → 频次聚合 → CF 探测（独立 DNS + IP 段
 
 ## 部署与使用
 
-### 方式一：安装脚本（可安装定时任务）
 
-从 [GitHub Release](https://github.com/jayvzh/cf-opt-adguard/releases) 下载对应架构的 tar.gz，解压后执行交互菜单：
+### 方式一：手动运行
 
-   ```bash
-   wget https://github.com/jayvzh/cf-opt-adguard/releases/latest/download/cf-opt-adguard-v0.1.0-linux-amd64.tar.gz
-   tar -xzf cf-opt-adguard-v0.1.0-linux-amd64.tar.gz && cd cf-opt-adguard-v0.1.0-linux-amd64
-   sudo bash install.sh
-   ```
-   安装向导会依次询问：AGH 地址与凭据、统计窗口（24h/7d/30d/2w）、点击频次阈值、运行间隔（一行输入"天 小时"，如 `0 6` = 每 6 小时、`1 0` = 每天）、CFST 目录与测速命令（默认 `./cfst -tl 200 -dn 20`）、独立 resolver。
-
-   定时任务：systemd 可用时注册 `cf-opt-adguard.service + .timer`（任意小时数精确）；否则回退 `/etc/cron.d/`（仅支持整点整除或整天步长，其他值就近取整并提示）。
-
-
-### 方式二：手动运行
-
-不用安装脚本，手动控制每一步。默认优选 IP 来源为 CFST 的 `result.csv`，把主二进制放进 CFST 目录（与 `cfst` 同级），复制 `config.example.yaml` 为 `config.yaml` 并按注释修改：
+默认优选 IP 来源为 CFST 的 `result.csv`，把主二进制放进 CFST 目录（与 `cfst` 同级），复制 `config.example.yaml` 为 `config.yaml` 并按注释修改：
 
 ```bash
 cd /opt/cfst                                # cfst 目录：cfst、cf-opt-adguard、config.yaml 同级
@@ -50,6 +37,42 @@ cd /opt/cfst                                # cfst 目录：cfst、cf-opt-adguar
 ./cf-opt-adguard run -c config.yaml --apply # 3. 确认无误后写入
 ```
 
+
+### 方式二：安装脚本（可安装定时任务）
+
+一条命令拉取脚本并进入交互菜单（会自动下载最新发布包并安装，需联网）：
+
+```bash
+sudo bash <(curl -sL https://github.com/jayvzh/cf-opt-adguard/raw/refs/heads/main/scripts/install.sh)
+```
+
+> 注意必须是进程替换 `<(...)`，不能写成 `curl ... | bash`——直管道会占住标准输入导致向导无法回答。脚本检测到这种误用时会报错并给出正确命令。
+
+安装向导会依次询问：AGH 地址与凭据、统计窗口（24h/7d/30d/2w）、点击频次阈值、运行间隔（一行输入"天 小时"，如 `0 6` = 每 6 小时、`1 0` = 每天）、CFST 目录与测速命令（默认 `./cfst -tl 200 -dn 20`）、独立 resolver；若目录中没有 cfst，会询问是否自动从 [CloudflareSpeedTest 官方 Release](https://github.com/XIU2/CloudflareSpeedTest/releases) 下载最新版（amd64/arm64 自动匹配）。
+
+安装后再次运行同一命令即进入管理菜单：
+
+| 菜单 | 子命令 | 说明 |
+| --- | --- | --- |
+| 1 | `install` | 安装 / 重新安装 |
+| 2 | `run-once` | 立即运行一次（cfst 测速 → 同步） |
+| 3 | `reconfig` | 修改配置并重载定时任务 |
+| 4 | `toggle` | 启用 / 暂停定时任务 |
+| 5 | `status` | 版本 / 定时状态 / 最近日志 |
+| 6 | `update` | 更新主程序二进制 |
+| 7 | `install-cfst` | 安装 / 更新 CloudflareSpeedTest 依赖 |
+| 8 | `uninstall` | 卸载（移除定时任务并删除安装目录） |
+
+定时任务：systemd 可用时注册 `cf-opt-adguard.service + .timer`（任意小时数精确）；否则回退 `/etc/cron.d/`（仅支持整点整除或整天步长，其他值就近取整并提示）。
+
+非交互安装（全部参数见 `bash install.sh help`）：
+
+```bash
+sudo bash <(curl -sL https://github.com/jayvzh/cf-opt-adguard/raw/refs/heads/main/scripts/install.sh) \
+    install --agh-url http://192.168.1.2:3000 --agh-user admin --agh-pass 'xxx' \
+    --window 24h --min-hits 10 --interval "0 6" \
+    --cfst-dir /opt/cfst --with-cfst       # --with-cfst 顺带自动下载 cfst；--skip-schedule 可先不装定时器
+```
 
 ## 免责声明
 

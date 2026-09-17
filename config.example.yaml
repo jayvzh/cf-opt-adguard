@@ -22,8 +22,9 @@ querylog:
 aggregate:
   # zone = 一级域混合归并（D14）；exact = 逐 host 精确（旧行为回退）
   mode: zone
-  min_hits_24h: 20
-  min_hits_7d: 50
+  # 频次阈值：24h 窗口用 min_hits_24h，7d/30d/2w 用 min_hits_7d
+  min_hits_24h: 10
+  min_hits_7d: 10
   # 探测预算上限（D15 护栏）
   max_domains: 1000
 
@@ -46,9 +47,9 @@ cfip:
   # 优选 IP 来源（默认 B，D17）：
   #   cfst:PATH    读取 CloudflareSpeedTest 测速结果 CSV（代码默认值 cfst:result.csv）
   #   domain:HOST  解析优选域名 | static:PATH 读取静态 IP 文件（每行一个）
-  # release 部署：把本二进制放入 CFST 发布目录（与 cfst、result.csv 同级），先自行运行
-  # CFST 测速，再执行本工具即可使用默认路径；MVP 不会调用 cfst 自动测速（自动测速为 P1）。
-  # 开发期可显式指向仓库内真实样例：
+  # install.sh 安装时会自动填为绝对路径（如 cfst:/opt/cf-opt-adguard/cfst/result.csv），
+  # run-opt.sh 先 cd 到该目录执行 ./cfst 测速生成 result.csv，再由本工具读取。
+  # 手动运行可填相对路径（相对于本工具的工作目录），开发期可指向仓库内样例：
   source: cfst:./references/CloudflareSpeedTest-master/releases/cfst_linux_amd64/result.csv
   # lowest_latency：cfst 来源取 CSV 首数据行（已按测速排序）；domain 来源取握手最快；roundrobin 轮转
   strategy: lowest_latency
