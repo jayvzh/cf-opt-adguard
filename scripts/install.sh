@@ -7,16 +7,14 @@ set -e
 APP_NAME="cf-opt-adguard"
 SERVICE_NAME="cf-opt-adguard"
 DEFAULT_INSTALL_DIR="/opt/cf-opt-adguard"
-# 打包时由 scripts/build-release.sh 用 sed 注入 GitHub releases 拉取基址；
-# 留空则仅支持本地安装（脚本同目录的二进制 / tar.gz）。
-DEFAULT_RELEASE_BASE_URL=""
+# GitHub releases 拉取基址（构建时 build-release.sh 会重新注入；此处为兜底默认）。
+DEFAULT_RELEASE_BASE_URL="https://github.com/jayvzh/cf-opt-adguard/releases/latest/download"
 
 action=""
 arch=""
 install_dir=""
 arg_url=""          # --url 覆盖拉取基址
 skip_schedule=false
-purge=false
 
 # 交互答案（parse_args 可预置，do_install 中逐项补默认）
 agh_url=""; agh_user=""; agh_pass=""
@@ -484,14 +482,8 @@ do_uninstall() {
     install_dir=${install_dir:-$DEFAULT_INSTALL_DIR}
     remove_schedule
     if [ -d "$install_dir" ]; then
-        if [ "$purge" = true ]; then
-            rm -rf "$install_dir"
-            _green "✅ 已彻底删除 $install_dir"
-        else
-            local bak="${install_dir}.bak.$(date +%Y%m%d%H%M%S)"
-            mv "$install_dir" "$bak"
-            _green "✅ 卸载完成（配置与数据已备份: $bak）"
-        fi
+        rm -rf "$install_dir"
+        _green "✅ 已卸载：定时任务已移除，$install_dir 已删除"
     else
         _yellow "未发现安装目录 $install_dir，仅清理定时任务。"
     fi
@@ -553,7 +545,6 @@ parse_args() {
             --install-dir) install_dir="$2"; shift 2 ;;
             --url)         arg_url="$2"; shift 2 ;;
             --skip-schedule) skip_schedule=true; shift ;;
-            --purge)       purge=true; shift ;;
             *) _red "未知参数: $1"; exit 1 ;;
         esac
     done
@@ -584,7 +575,7 @@ Commands:
   toggle      启用 / 暂停 定时任务
   status      查看版本 / 定时状态 / 最近日志
   update      更新二进制（保留配置与日志）
-  uninstall   卸载（默认备份式删除）
+  uninstall   卸载（移除定时任务并删除安装目录）
   help        本帮助
 
 Options:
@@ -600,7 +591,6 @@ Options:
   --install-dir <dir>    安装目录（默认 /opt/cf-opt-adguard）
   --url <base>           发布包拉取基址（.../releases/latest/download）
   --skip-schedule        只落文件不装定时任务（测试用）
-  --purge                卸载时彻底删除（不备份）
 
 示例:
   sudo bash install.sh                        # 交互菜单

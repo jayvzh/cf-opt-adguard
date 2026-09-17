@@ -11,6 +11,8 @@ STAGE_ROOT="release/pkg"
 ARCHS=(amd64 arm64)
 
 # 从 git remote 推导 GitHub 拉取基址（注入 install.sh 的 DEFAULT_RELEASE_BASE_URL）。
+# 推导失败时回退到固定仓库地址。
+DEFAULT_REPO_URL="https://github.com/jayvzh/cf-opt-adguard/releases/latest/download"
 release_base_url() {
     local remote
     remote=$(git remote get-url origin 2>/dev/null || true)
@@ -18,7 +20,7 @@ release_base_url() {
     if [[ "$remote" =~ github.com[:/](.+)/([^/]+)$ ]]; then
         echo "https://github.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/releases/latest/download"
     else
-        echo "" # 无 GitHub remote：install.sh 回退本地安装
+        echo "$DEFAULT_REPO_URL"
     fi
 }
 BASE_URL=$(release_base_url)

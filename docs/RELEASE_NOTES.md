@@ -1,6 +1,4 @@
-# Release v0.1.0 — 首个公开发布
-
-> AdGuard Home × Cloudflare 优选 IP 自动编排器：从 AGH 查询日志挖掘高频域名，独立探测确认 Cloudflare CDN，自动维护 DNS 重写规则。
+# Release v0.1.0
 
 ## 功能亮点
 
@@ -8,43 +6,6 @@
 - **独立 CF 探测**：DNS CNAME 指向 + Cloudflare IP 段归属 + HTTP 响应头三信号打分，不轻信单一特征。
 - **优选 IP 接入 CloudflareSpeedTest**：直接读取 CFST 的 `result.csv`，v4/v6 区分，多 IP 择优。
 - **安全默认**：`run` 默认 dry-run 只打印计划，`--apply` 才写入；测速失败自动中止本轮，不复用旧结果。
-- **一键安装管理脚本**（install.sh）：
-  - 交互菜单：安装 / 立即运行 / 重配置 / 定时启停 / 状态日志 / 更新 / 卸载
-  - 支持 GitHub Release 拉取或本地包安装（amd64 / arm64）
-  - systemd timer 优先（任意小时数精确调度），无 systemd 自动回退 cron
-  - 定时编排：先 CFST 测速生成 `result.csv`，再执行同步流水线
-
-## 下载
-
-| 文件 | 平台 |
-| --- | --- |
-| `cf-opt-adguard-v0.1.0-linux-amd64.tar.gz` | Linux x86_64 |
-| `cf-opt-adguard-v0.1.0-linux-arm64.tar.gz` | Linux ARM64 |
-| `checksums.txt` | SHA256 校验和 |
-
-包内含：`cf-opt-adguard` 主二进制、`install.sh` 安装管理脚本、`config.example.yaml` 配置样例。
-
-## 快速开始
-
-```bash
-# 1. 下载并解压（按架构选择）
-wget https://github.com/<OWNER>/<REPO>/releases/download/v0.1.0/cf-opt-adguard-v0.1.0-linux-amd64.tar.gz
-tar -xzf cf-opt-adguard-v0.1.0-linux-amd64.tar.gz && cd cf-opt-adguard-v0.1.0-linux-amd64
-
-# 2. 交互式安装（含配置向导与定时任务）
-sudo bash install.sh
-```
-
-安装向导会依次询问：AGH 地址与凭据、统计窗口（24h/7d/30d/2w）、点击频次阈值、运行间隔（一行输入"天 小时"，如 `0 6` = 每 6 小时、`1 0` = 每天）、CFST 目录与测速命令（默认 `./cfst -tl 200 -dn 20`）。
-
-非交互安装示例：
-
-```bash
-sudo bash install.sh install \
-    --agh-url http://192.168.1.2:3000 --agh-user admin --agh-pass 'xxx' \
-    --window 24h --min-hits 20 --interval "0 6" \
-    --cfst-dir /opt/cfst --cfst-cmd "./cfst -tl 200 -dn 20"
-```
 
 ## 前置要求
 
@@ -55,9 +16,16 @@ sudo bash install.sh install \
 
 ## 注意事项
 
-- 首次使用建议先在测试实例验证：手动跑一次 dry-run 核对计划无误后再启用 `--apply` 定时同步。
+- 首次使用建议先手动跑一次 dry-run 核对计划无误后再启用定时同步（`run` 默认即 dry-run，只打印计划不写入）：
+
+  ```bash
+  cd /opt/cfst && ./cfst -tl 200 -dn 20                    # 测速生成 result.csv
+  ./cf-opt-adguard run -c config.yaml                      # 核对计划
+  ./cf-opt-adguard run -c config.yaml --apply              # 确认无误后再写入
+  ```
+
 - 安装目录默认 `/opt/cf-opt-adguard`；`config.yaml` 含明文密码（600 权限），可改用 `${AGH_PASSWORD}` 环境变量形态。
-- 卸载默认备份式删除（`<安装目录>.bak.时间戳`），加 `--purge` 彻底删除。
+- 卸载由 `install.sh` 的卸载菜单/子命令执行：停止定时任务并直接删除安装目录（含配置与数据），请提前备份 `config.yaml`。
 
 ## 免责声明
 
