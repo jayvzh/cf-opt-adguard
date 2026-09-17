@@ -1,314 +1,112 @@
-可以。下面按 **PRD 核心思路** 给你构思一个工具，定位是：
+# cf-opt-adguard 产品需求文档（PRD.md）
 
-> **一个外部编排器 / 自动化同步器，不是 AdGuard Home 插件。**  
-> 因为 AdGuard Home 目前不能“根据响应 IP 自动判断并重写”，所以工具必须自己完成：  
-> **发现常用 Cloudflare 域名 → 独立探测确认 → 获取优选 IP → 通过 AdGuard API 写入 DNS 重写规则 → 定期增量更新。**
+> 版本：v0.2 ｜ 状态：设计稿（项目尚未开工，2026-09-17）
+> 本文只回答：做什么、为谁做、不做什么、业务规则。技术实现见 [ARCHITECTURE.md](ARCHITECTURE.md)，接口字段见 [API.md](API.md)。
+> 相关：[ARCHITECTURE.md](ARCHITECTURE.md)、[API.md](API.md)、[decisions.md](decisions.md)。
+> 更新时机：需求范围、功能优先级、业务默认值发生变化时（同步检查架构文档是否受影响）。
 
 ---
 
-## 1. 工具定位与目标
+## 1. 项目定位
 
-**暂定名：** `CF-AGH-Rewriter` / `cf-opt-adguard` / `AdGuard-CF-AutoRewrite`
+**名称**：`cf-opt-adguard`（2026-09-17 定名，见 [decisions.md](decisions.md) D9；Go module path 在 git init 时按仓库地址确定）。
 
-**核心一句话：**  
-从 AdGuard Home 查询日志中挖掘高频域名，用独立 DNS/HTTP 探测筛选出 Cloudflare CDN 域名，再自动把优选 IP 写成 AdGuard Home 的 DNS 重写规则，并持续更新。
+**一句话**：从 AdGuard Home（下称 **AGH**）查询日志中挖掘高频域名，独立探测确认其中的 Cloudflare CDN 域名，自动把优选 IP 写为 AGH 的 DNS 重写规则，并持续增量更新。
 
-**目标：**
-- 不再手动改 hosts。
-- 不再手动维护每个 Cloudflare 站点。
+**产品形态**：本地运行的**外部编排器 / 自动化同步器**，不是 AGH 插件，不修改 AGH 核心。AGH 本身不支持"按响应 IP 自动判断并重写"，所以"发现 → 探测 → 取优选 IP → 写入 → 增量维护"整条链路由本工具完成。
+
+### 用户只需要维护
+
+- 一个 AGH 连接配置；
+- 一个优选 IP 来源（优选域名，或一个 CloudflareSpeedTest 测速任务，或静态 IP 列表）。
+
+其余全部自动：高频 CF 站点自动加入、不常用站点自动淘汰。
+
+## 2. 背景与问题
+
+1. Cloudflare 站点访问质量依赖边缘 IP，手动维护 hosts / 手动在 AGH 里逐条加 DNS 重写，繁琐且易过期。
+2. 常用站点随时间变化，人工无法持续发现新域名、淘汰旧域名。
+3. 社区现有脚本（见 `references/CloudflareSpeedTest-Adguard-Script-main`）只能把**单个**优选域名同步成**单条**规则，并通过全量覆盖用户自定义规则实现，无法批量覆盖常用站点。
+
+## 3. 目标与非目标
+
+### 3.1 目标
+
+- 不再手动改 hosts，不再逐个站点维护 Cloudflare 重写。
 - 只维护一个优选 IP / 优选域名来源。
-- AdGuard Home 自动获得一批 `域名 -> 优选 IP` 的重写规则。
+- AGH 自动获得一批 `域名 → 优选 IP` 的重写规则。
 - 新常用站点自动加入，不常用站点自动淘汰。
-- 支持 dry-run、增量更新、回滚、通知。
+- 支持 dry-run 预览、增量更新、状态持久化；更新与回滚能力可演进。
 
-**非目标：**
-- 不修改 AdGuard Home 核心。
-- 不实现 AdGuard 官方不支持的“基于响应 IP 重写”。
-- 不保证覆盖所有 Cloudflare 站点。
+### 3.2 非目标（明确不做）
+
+- 不修改 AGH 核心，不实现 AGH 官方不支持的"基于响应 IP 重写"。
+- 不保证覆盖所有 Cloudflare 站点（只覆盖查询日志中高频且探测确认的域名）。
 - 不绕过 Cloudflare 风控或源站限制。
+- 不做云端服务：查询日志包含隐私，工具本地运行、本地存储，不对外上传数据。
+- MVP 不做 Web UI、不做内置定时器（依赖外部 cron / systemd timer）、不多实例管理。
 
----
+## 4. 用户故事
 
-## 2. 核心用户故事
+1. 我配置好 AGH 地址、账号和优选 IP 来源。
+2. 工具读取最近时间窗口内的查询日志，统计高频域名。
+3. 工具用**独立 DNS** 解析候选域名，检查 CNAME / A 记录是否指向 Cloudflare。
+4. 工具再用 HTTP 响应头（`cf-ray`、`server: cloudflare` 等）二次确认。
+5. 工具解析我的优选域名（如 `cfip.yyyyt.top`），拿到当前优选 IP。
+6. 工具通过 AGH API 添加 DNS 重写：`example.com → 优选 IP`。
+7. 之后我访问这些站点，AGH 直接返回优选 IP。
+8. 再次运行只做增量：新增、更新、删除，不重复添加、不全量重建。
+9. 我可以在 dry-run 中看到"将新增 12 条，更新 3 条，删除 5 条"及完整规则清单，确认后再实际写入。
 
-1. 作为用户，我配置好 AdGuard Home 地址和优选 IP 来源。
-2. 工具读取最近 7 天查询日志，统计高频域名。
-3. 工具用独立 DNS 解析这些域名，检查 CNAME / A 记录是否指向 Cloudflare。
-4. 工具再用 HTTP 头 `cf-ray`、`server: cloudflare` 等二次确认。
-5. 工具解析我的优选域名 `cfip.yyyyt.top`，拿到当前优选 IP。
-6. 工具通过 AdGuard API 添加 DNS 重写：`example.com -> 优选 IP`。
-7. 之后我访问这些站点，AdGuard 直接返回优选 IP。
-8. 下次运行，工具只做增量：新增、更新、删除。
-9. 我可以在 dry-run 中看到“将新增 12 条，更新 3 条，删除 5 条”。
+## 5. 功能需求
 
----
+### 5.1 P0（MVP 必做）
 
-## 3. 总体架构与数据流
+| 编号 | 能力 | 说明（业务视角） |
+| --- | --- | --- |
+| F1 | 查询日志采集 | 按时间窗口（24h / 7d / 30d）拉取 AGH 查询日志；只统计正常响应的 A / AAAA 查询；支持客户端白名单 / 黑名单；排除本地域名、内网域名、广告拦截域名与已知非 CF 域名 |
+| F2 | 域名聚合与频次统计 | 域名归一化（小写、去尾点、IDN）；支持精确域名（默认）与可注册域两种聚合粒度；统计查询次数与首次 / 最后出现时间；达到频次阈值才进入候选 |
+| F3 | Cloudflare 探测 | 独立 DNS 解析（不受本机 AGH 重写影响）+ 官方 IP 段比对 + HTTP 头多信号确认；输出 `confirmed_cf` / `maybe_cf` / `not_cf` 三态；仅 `confirmed_cf` 进入重写 |
+| F4 | 优选 IP 获取 | 三种来源：A 解析优选域名（默认）；B 调用 CloudflareSpeedTest 读取测速结果；C 读取静态 IP 列表；支持 IPv4 / IPv6；多 IP 时按策略选择 |
+| F5 | AGH DNS 重写同步 | 使用 AGH Rewrite API 增量同步（新增 / 更新 / 删除）；只写解析后的 IP，不写域名型 CNAME 重写；通配符需显式开启，默认关闭 |
+| F6 | 增量更新与状态管理 | 本地状态库记录域名、命中、置信度、当前重写 IP 与状态（active / pending / removed）；每次运行基于 AGH 现状与本地状态计算 diff；禁止全量删除再添加 |
+| F7 | dry-run 与日志 | **默认只输出计划不写 AGH**，显式 `--apply` 才实际写入（D10）；输出候选数、确认数、增 / 改 / 删条数与具体规则；支持日志级别与文件日志 |
+| F8 | 运行后验证 | 写入后通过 AGH 回查域名解析结果是否为目标 IP；失败条目记录并告警，不影响其他条目 |
 
-```text
-AdGuard Home Query Log
-        │
-        ▼
-[采集器] 拉取查询日志 / 统计
-        │
-        ▼
-[聚合器] 域名归一化、频次统计、去重、时间衰减
-        │
-        ▼
-[候选域名列表]
-        │
-        ▼
-[CDN 探测器] 独立 DNS 解析 + HTTP 头检测 + CF IP 段比对
-        │
-        ▼
-[Cloudflare 确认列表]
-        │
-        ▼
-[优选 IP 解析器] 解析 cfip.yyyyt.top / 调用 CloudflareST
-        │
-        ▼
-[规则生成器] 生成 DNS Rewrite 规则
-        │
-        ▼
-[AdGuard 同步器] 调用 /control/rewrite/*
-        │
-        ▼
-[验证器] 查询 AdGuard DNS 验证是否生效
-        │
-        ▼
-[状态库] SQLite / JSON，记录域名、IP、时间、状态
-```
+### 5.2 P1（增强）
 
----
+- 内置定时调度（cron 表达式），不依赖外部定时器。
+- 通知：Webhook / Telegram / 邮件（同步结果与失败告警）。
+- 强制白名单 / 黑名单（必含 / 必排域名）。
+- 规则一键暂停 / 回滚。
+- 自动调用 CloudflareSpeedTest 测速并更新优选 IP。
+- 多 AGH 实例同步；按客户端分组下发不同策略。
 
-## 4. 功能需求
+### 5.3 P2（高级）
 
-### P0 / MVP
+- Web UI：状态查看、手动确认、一键回滚。
+- 智能聚合：只对真正 CF 的子域重写，不污染根域。
+- A/B 测速对比、规则版本化。
+- 与 Nginx Proxy Manager、Docker 标签等外部发现源集成。
 
-1. **AdGuard 查询日志采集**
-   - 调用 `GET /control/querylog` 分页拉取。
-   - 支持时间窗口：24h / 7d / 30d。
-   - 只保留 A / AAAA 查询、NOERROR 响应。
-   - 支持客户端白名单 / 黑名单。
-   - 排除本地域名、内网域名、广告域名、已知非 CF 域名。
+## 6. 业务规则与默认值
 
-2. **域名聚合与频次统计**
-   - 归一化：小写、去尾点、IDN 转换。
-   - 支持两种聚合：
-     - 精确域名：`assets.example.com`
-     - 可注册域 / 根域：`example.com`
-   - 统计查询次数、首次出现、最后出现。
-   - 阈值：如 24h 内 >= 20 次，或 7d 内 >= 50 次。
+> 这些是产品层面的默认护栏；技术实现（打分权重、分页方式等）见 [ARCHITECTURE.md](ARCHITECTURE.md)。改动默认值必须同步本文与配置文档。
 
-3. **Cloudflare CDN 探测**
-   - 使用独立 DNS 解析器，避免被 AdGuard 重写影响。
-   - 解析 CNAME 链：是否包含 `cloudflare.net`、`cloudflare.com`、`cdn.cloudflare.net`。
-   - 解析最终 A / AAAA：是否落在 Cloudflare 官方 IP 段。
-   - HTTP/HTTPS HEAD 请求：检查 `cf-ray`、`server: cloudflare`、`cf-cache-status`。
-   - 多信号加权，达到阈值才确认。
-   - 可调用 `cdncheck` 作为辅助。
+| 规则 | 默认值 |
+| --- | --- |
+| 查询时间窗口 | 7 天（支持 24h / 7d / 30d） |
+| 高频候选阈值 | 24h 内 ≥ 20 次，或 7d 内 ≥ 50 次 |
+| 聚合粒度 | 精确域名；根域聚合需显式开启 |
+| 通配符重写（`*.example.com`） | 默认关闭，显式开启才使用 |
+| 淘汰 TTL | 30 天未出现则删除重写（状态先转 pending，到期 removed） |
+| 调度频率（外部定时器） | 建议每 1~6 小时一次（定时命令需显式带 `--apply`） |
+| 默认运行模式 | dry-run（只出计划）；显式 `--apply` 才写入（D10） |
+| 目标 AGH 版本 | P0 仅支持新版 querylog 参数（D11） |
+| 探测确认 | 多信号加权达到阈值才确认；`maybe_cf` 只记录不写入 |
+| 优选 IP 不可用时 | 本次运行中止写入，保留现有规则不动 |
 
-4. **优选 IP 获取**
-   - 方式 A：解析用户提供的优选域名，如 `cfip.yyyyt.top`。
-   - 方式 B：调用 `CloudflareSpeedTest` / `CloudflareST` 生成 `result.csv`。
-   - 方式 C：读取用户手动维护的 IP 列表。
-   - 支持 IPv4 / IPv6。
-   - 如果优选域名返回多个 IP，选择延迟最低或轮询。
-
-5. **AdGuard DNS 重写同步**
-   - 推荐使用 AdGuard DNS Rewrite API：
-     - `GET /control/rewrite/list`
-     - `POST /control/rewrite/add`
-     - `POST /control/rewrite/delete`
-   - 添加形式：
-     - `domain: example.com`
-     - `answer: 104.16.x.x`
-   - 也可生成过滤规则：
-     - `||example.com^$dnsrewrite=104.16.x.x`
-   - 注意：`$dnsrewrite=cfip.yyyyt.top` 这种写法不推荐，最好先解析成 IP 再写。
-   - 支持通配符：`*.example.com`，但需谨慎，避免误伤。
-
-6. **增量更新与状态管理**
-   - 本地 SQLite 记录：
-     - 域名、根域、命中次数、首次/最后出现
-     - CF 置信度、探测信号
-     - 当前重写 IP、AdGuard 规则 ID
-     - 状态：active / pending / removed
-   - 每次运行计算 diff：
-     - 新增：新确认的 CF 域名
-     - 更新：优选 IP 变化
-     - 删除：TTL 内不再高频或不再确认 CF
-   - 避免全量删除再添加。
-
-7. **dry-run 与日志**
-   - `--dry-run` 只输出计划，不调用写 API。
-   - 输出：
-     - 候选域名数
-     - CF 确认数
-     - 新增 / 更新 / 删除条数
-     - 具体规则列表
-   - 支持日志级别、文件日志。
-
-### P1 / 增强
-
-- 定时调度：内置 cron / systemd timer。
-- 通知：Telegram、Webhook、邮件。
-- 白名单 / 黑名单：强制包含或排除某些域名。
-- TTL 淘汰：30 天未出现自动删除。
-- 多 AdGuard 实例同步。
-- Web UI：查看状态、手动确认、一键回滚。
-- 自动调用 CloudflareST 测速并更新优选 IP。
-- 按客户端策略：不同客户端使用不同优选 IP。
-
-### P2 / 高级
-
-- 智能聚合：只对真正 CF 的子域重写，不污染主域。
-- A/B 测速：对比优选 IP 的实际访问速度。
-- 规则版本化与回滚。
-- 与 Nginx Proxy Manager、Docker 标签等自动发现集成。
-
----
-
-## 5. 调用工具 / API 清单
-
-| 类别 | 工具 / API | 用途 |
-|---|---|---|
-| AdGuard | `GET /control/querylog` | 获取查询日志 |
-| AdGuard | `GET /control/stats` | 辅助统计 |
-| AdGuard | `GET /control/rewrite/list` | 获取现有 DNS 重写 |
-| AdGuard | `POST /control/rewrite/add` | 添加 DNS 重写 |
-| AdGuard | `POST /control/rewrite/delete` | 删除 DNS 重写 |
-| AdGuard | `GET /control/filtering/status` | 如需操作自定义规则 |
-| Cloudflare | `https://api.cloudflare.com/client/v4/ips` | 获取 CF 官方 IP 段 |
-| Cloudflare | `https://www.cloudflare.com/ips-v4` / `ips-v6` | 备用 IP 段 |
-| CDN 探测 | `cdncheck` | 识别 IP / 域名是否属于 CF |
-| 优选 IP | `CloudflareSpeedTest` / `CloudflareST` | 测速获取优选 IP |
-| 优选域名 | 解析 `cfip.yyyyt.top` | 获取当前优选 IP |
-| DNS 解析 | `miekg/dns` / DoH | 独立解析 CNAME / A |
-| HTTP 检测 | Go `net/http` | 检查 `cf-ray` 等响应头 |
-| 存储 | SQLite / JSON | 状态、历史、diff |
-| 调度 | cron / systemd timer | 定时运行 |
-| 通知 | Telegram / Webhook | 更新通知 |
-
----
-
-## 6. 核心探测逻辑
-
-对每个候选域名：
-
-1. 用独立 DNS 解析：
-   - 查询 CNAME 链。
-   - 查询 A / AAAA。
-2. 判断：
-   - CNAME 是否包含 `cloudflare.net`、`cloudflare.com`、`cdn.cloudflare.net`。
-   - A / AAAA 是否在 Cloudflare 官方 IP 段。
-3. HTTP 检测：
-   - 发 HEAD 请求。
-   - 检查响应头：
-     - `cf-ray`
-     - `server: cloudflare`
-     - `cf-cache-status`
-4. 打分：
-   - CNAME 命中 +2
-   - IP 段命中 +2
-   - `cf-ray` +3
-   - `server: cloudflare` +1
-   - 总分 >= 4 确认。
-5. 输出：
-   - `confirmed_cf`
-   - `maybe_cf`
-   - `not_cf`
-
----
-
-## 7. 同步与更新策略
-
-- 默认每 1 小时或每 6 小时运行一次。
-- 查询日志窗口：7 天。
-- 高频阈值：24h 内 >= 20 次。
-- 优选 IP 更新：
-  - 解析 `cfip.yyyyt.top`。
-  - 如果 IP 变化，批量更新所有相关重写。
-- 淘汰：
-  - 30 天未出现，删除重写。
-- 幂等：
-  - 先拉取 AdGuard 现有重写。
-  - 对比本地状态。
-  - 只添加缺失、删除多余、更新变化。
-- 验证：
-  - 向 AdGuard 查询 `example.com`。
-  - 检查返回 IP 是否为优选 IP。
-  - 失败则告警，可选回滚。
-
----
-
-## 8. 实现效果
-
-配置一次后：
-
-```text
-候选域名：153
-Cloudflare 确认：42
-新增重写：12
-更新重写：3
-删除重写：5
-当前有效规则：42
-```
-
-用户访问这些常用 CF 站点时，AdGuard 直接返回优选 IP。  
-用户只需要维护一个优选域名 `cfip.yyyyt.top` 或一个 CloudflareST 测速任务。  
-新常用站点自动加入，不常用站点自动淘汰。  
-支持 dry-run 预览，不怕误操作。  
-支持通知，更新后知道发生了什么。
-
----
-
-## 9. 风险与限制
-
-1. **AdGuard 不支持基于响应 IP 重写**  
-   所以工具必须显式维护域名列表，不能真正“一条规则覆盖所有 CF 域名”。
-
-2. **误判风险**  
-   某些域名 CNAME 到 Cloudflare，但可能还有多 CDN 调度。重写到优选 IP 通常仍由 CF 边缘处理，但可能影响特定地区线路。
-
-3. **`$dnsrewrite=cfip.yyyyt.top` 不推荐**  
-   最好由工具解析优选域名得到 IP，再写 `answer: IP`。
-
-4. **AdGuard API 限流**  
-   批量操作要加延迟、重试、错误处理。
-
-5. **隐私**  
-   查询日志包含用户访问记录，工具应本地运行，不对外上传。
-
-6. **规则污染**  
-   如果聚合到根域，可能把非 CF 子域也重写。建议默认精确域名，谨慎使用通配符。
-
----
-
-## 10. 建议技术栈与 MVP 命令
-
-**推荐：Go**
-- 单二进制，部署简单。
-- 网络库强：`miekg/dns`、`net/http`。
-- 易调用 AdGuard REST API。
-- 易集成 `cdncheck`、CloudflareST。
-- SQLite 状态存储。
-
-**MVP 命令示例：**
-
-```bash
-cf-agh-rewriter run \
-  --agh-url http://192.168.1.2:3000 \
-  --agh-user admin \
-  --agh-pass ****** \
-  --window 7d \
-  --min-hits 20 \
-  --cfip-source domain:cfip.yyyyt.top \
-  --sync-mode rewrite-api \
-  --dry-run
-```
-
-**输出示例：**
+## 7. 典型运行效果（预期）
 
 ```text
 [采集] 查询日志 12000 条
@@ -319,22 +117,17 @@ cf-agh-rewriter run \
 [DRY-RUN] 未写入 AdGuard
 ```
 
----
+## 8. 风险与限制（产品视角）
 
-## 11. 验收标准
+1. **不能一条规则覆盖所有 CF 域名**：AGH 不支持基于响应 IP 重写，工具必须显式维护高频域名集合，覆盖率受日志窗口与阈值影响。
+2. **误判风险**：多 CDN 调度的域名可能被确认；重写到优选 IP 通常仍由 CF 边缘处理，但可能影响特定地区线路。`maybe_cf` 不写入、探测信号可追溯，用于控制该风险。
+3. **规则污染**：聚合到根域或滥用通配符可能误伤同根域下的非 CF 子域，因此默认仅精确域名。
+4. **隐私边界**：查询日志包含用户访问记录，工具只在本地运行与存储，探测阶段仅对候选域名本身发起必要的 DNS / HTTP 请求。
+5. **AGH 版本差异**：不同版本查询日志与重写接口存在参数 / 字段差异，兼容成本随目标版本而定（实测清单见 [pitfalls.md](pitfalls.md)）。
 
-- 对已知 Cloudflare 域名识别准确率 > 95%。
-- 对非 CF 域名误判率 < 1%。
-- 100 条规则同步 < 10 秒。
-- 支持 dry-run。
-- 支持增量更新，不重复添加。
-- 支持 API 失败重试。
-- 支持状态持久化，重启后不丢。
-- 支持一键暂停 / 回滚。
+## 9. 验收标准
 
----
-
-总结：  
-**这个工具的核心不是让 AdGuard 自动识别 Cloudflare，而是做一个外部“发现 + 探测 + 同步”的编排器。**  
-它调用 AdGuard 查询日志 API、Cloudflare IP 段、`cdncheck`、CloudflareST / 优选域名解析，最后通过 AdGuard DNS Rewrite API 写入规则。  
-这样你只需要维护一个优选 IP 来源，剩下的高频 CF 域名发现和规则同步都交给工具。
+- 已知 Cloudflare 域名识别准确率 > 95%；非 CF 域名误判率 < 1%。
+- 100 条规则同步耗时 < 10 秒。
+- 支持 dry-run；支持增量更新、不重复添加；API 失败可重试、单条失败不阻断整批。
+- 状态持久化，重启后不丢；支持暂停 / 回滚（回滚能力至少在 P1 前具备手动方案）。
