@@ -1,0 +1,71 @@
+# cf-opt-adguard 配置示例（键与 docs/DATA_MODEL.md §4 一一对应）
+# 复制为 config.yaml 使用；密码支持 ${ENV_VAR} 展开（如 ${AGH_PASSWORD}）。
+
+adguard:
+  # AdGuard Home 地址与凭据（第一/第二阶段仅做只读采集）
+  url: http://192.168.1.2:3000
+  username: admin
+  password: ${AGH_PASSWORD}
+  timeout: 10s
+
+querylog:
+  # 采集窗口：支持 24h / 7d / 30d / 2w（超过 30d 可能被 AGH 自身保留期截断）
+  window: 7d
+  # 单页条数与翻页上限（护栏：防止超大日志拖垮采集）
+  page_size: 500
+  max_pages: 200
+  fetch_timeout: 5m
+  # 客户端过滤（可选；include 生效时 exclude 不参与）
+  # clients_include: ["192.168.1.10"]
+  # clients_exclude: ["192.168.1.99"]
+
+aggregate:
+  # zone = 一级域混合归并（D14）；exact = 逐 host 精确（旧行为回退）
+  mode: zone
+  min_hits_24h: 20
+  min_hits_7d: 50
+  # 探测预算上限（D15 护栏）
+  max_domains: 1000
+
+domains:
+  # 域名黑白名单（可选，匹配归一化后的完整域名）
+  # include: ["example.com"]
+  # exclude: ["intranet.local", "*.corp"]
+
+detector:
+  # 独立 resolver，禁止指向本机 AGH（保证解析路径独立）
+  resolvers: ["223.5.5.5", "119.29.29.29"]
+  concurrency: 8
+  timeout: 3s
+  # HTTP 头探测（server: cloudflare 加分项）
+  http_enabled: true
+  # confirmed 判定分数线（打分表见 docs/ARCHITECTURE.md §4.4）
+  score_threshold: 4
+
+cfip:
+  # 优选 IP 来源（默认 B，D17）：
+  #   cfst:PATH    读取 CloudflareSpeedTest 测速结果 CSV（代码默认值 cfst:result.csv）
+  #   domain:HOST  解析优选域名 | static:PATH 读取静态 IP 文件（每行一个）
+  # release 部署：把本二进制放入 CFST 发布目录（与 cfst、result.csv 同级），先自行运行
+  # CFST 测速，再执行本工具即可使用默认路径；MVP 不会调用 cfst 自动测速（自动测速为 P1）。
+  # 开发期可显式指向仓库内真实样例：
+  source: cfst:./references/CloudflareSpeedTest-master/releases/cfst_linux_amd64/result.csv
+  # lowest_latency：cfst 来源取 CSV 首数据行（已按测速排序）；domain 来源取握手最快；roundrobin 轮转
+  strategy: lowest_latency
+  # P0 仅 v4（v6 需 CFST 另跑 ipv6 后开启）
+  ip_versions: [4]
+
+sync:
+  mode: rewrite-api
+  # zone 模式允许生成 *.zone 通配条目（D14；AGH 通配 rewrite 待真实实例实测）
+  wildcard: true
+  ttl: 720h        # 30d
+  rate_limit: 200ms
+  retry: 3
+
+runtime:
+  db_path: ./data/state.db
+  # false = dry-run（D10 默认，绝不写 AGH）；true 仅供第二阶段 live 模式
+  apply: false
+  log_level: info
+  # log_file: ./data/cf-opt-adguard.log

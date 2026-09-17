@@ -10,7 +10,7 @@
 ## 1. 环境
 
 - 语言：Go（本机 go1.27.1；go.mod 版本在工程初始化时声明，声明后团队以 go.mod 为准）。
-- 工程当前**尚未 `go mod init`、无代码**；初始化后标准命令：`go build ./...`、`go vet ./...`、`go test ./...`、`gofmt -l .`。
+- 工程**已初始化**（module path `cf-opt-adguard`，M1–M4 已实现）；标准命令：`go build ./...`、`go vet ./...`、`go test ./...`、`gofmt -l .`。
 - 目标运行环境：用户本地 / NAS（Linux 为主，兼容 macOS / Windows 单二进制）；依赖 AGH 实例与外部网络（或用户配置的 resolver）。
 - 敏感信息只允许出现在本地 `config.yaml`（不入库），仓库只提供 `config.example.yaml`。
 
@@ -20,7 +20,7 @@
 2. **测试不许碰真实 AGH / 公网写操作**：自动化测试一律 `httptest` 假服务器 + `testdata/` 夹具；对真实实例只允许只读核对与用户明确授权下的一次 live 验证。
 3. **外部契约以实测为准**：AGH / CF / CFST 的字段、参数、返回值编码前先核实（目标实例或官方源码），禁止照抄 PRD、搜索结果或记忆；发现与文档不符，先改 [API.md](API.md) 并登记 [pitfalls.md](pitfalls.md)，再写代码。
 4. **answer 只写裸 IP**：禁止把优选域名、`$dnsrewrite=` 语法或 CNAME 目标写进 rewrite answer。
-5. **默认精确域名**：根域聚合（`zone`）与通配（`*.`）必须配置显式开启；代码里不得出现默认通配。
+5. **防误伤优先（D14）**：默认 zone 混合归并——zone 内仅 1 个达阈 host 用精确、≥2 全 confirmed 且 `sync.wildcard: true` 才允许通配、混入 maybe/not_cf 自动回退逐 host 精确；`aggregate.mode: exact` 为显式退回项。禁止无条件默认通配。
 6. **只增量、只动托管集合**：禁止全量删除再添加；状态库外的用户手工 rewrite 一律不碰。
 7. **优选 IP 为空 / 前置阶段失败时不得写 AGH**，尤其不得执行删除。
 8. **范围红线**：一次只做 P0 链路；P1（通知、内置调度、回滚、多实例）、P2（Web UI 等）允许预留接口定义，禁止提前实现。
@@ -94,7 +94,7 @@
 [ ] 新增纯函数（聚合 / 打分 / diff）有表驱动单测；adguard / syncer 测试只用 httptest 夹具
 [ ] 没有任何对真实 AGH / 公网的写操作出现在测试或调试代码中
 [ ] 所有写调用都经 planner 计划且只出现在 syncer
-[ ] answer 全部是裸 IP；通配 / zone 聚合确认为显式开启
+[ ] answer 全部是裸 IP；通配仅在 zone 全 confirmed 且 wildcard 显式开启时出现（D14）
 [ ] 外部接口字段与实测一致，差异已记入 pitfalls
 [ ] 默认 dry 模式确认无任何写调用；只有显式 --apply 才走 syncer 写路径
 [ ] 优选 IP 为空 / 前置失败路径已确认不会触发写或删

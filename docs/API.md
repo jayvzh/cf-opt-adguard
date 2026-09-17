@@ -89,6 +89,7 @@
 
 - `answer` 只允许写**解析后的裸 IP**（IPv4 / IPv6 文本）；禁止写优选域名或 `$dnsrewrite=` 语法（见 [decisions.md](decisions.md) D4）。
 - 同域名不同地址族 = 不同条目（domain+answer 共同标识一条）。
+- **通配条目**：`domain` 字段可带 `*.` 前缀（如 `*.example.com`），AGH rewrite 源码支持该形态；本工具 zone 归并（D14）在多 host 全 confirmed 时生成 `zone` + `*.zone` 两条。⚠️ 真实实例行为待实测（新增通配测试条目属写操作，须用户显式授权，见计划 §7）。
 - 写操作限速、重试、单条失败隔离，机制见 [ARCHITECTURE.md](ARCHITECTURE.md) §4.6。
 - **不使用** `/control/filtering/set_rules` 通道（它全量覆盖用户规则，原因见 [pitfalls.md](pitfalls.md) 第 3 条）。
 
@@ -112,12 +113,14 @@
 
 ## 6. CloudflareSpeedTest 集成契约
 
-- 本工具不实现测速：按需调用外部 `CloudflareSpeedTest` 二进制（路径 / 参数可配），等待退出后读取结果文件。
-- 默认输出 `result.csv`（vendored 源码取证），首行中文表头，其后按丢包率 / 延迟、下载速度排序，**第二行第一列即最优 IP**：
+- 本工具不实现测速，**MVP 也不调用 / 拉起 CFST 二进制**：测速由用户自行运行 CloudflareSpeedTest 完成，本工具只读取其产出的结果文件（D17；自动调用测速为 P1）。
+- **部署约定**：release 的 `cf-opt-adguard` 二进制放入 CFST 发布目录（与 `cfst` 可执行文件、`result.csv` 同级）执行；`cfip.source` 默认 `cfst:result.csv`（相对于进程工作目录），该约定下无需额外路径配置。
+- 默认输出 `result.csv`（vendored 源码取证），首行中文表头，其后按丢包率 / 延迟、下载速度排序，**第二行第一列即最优 IP**。真实样例（`references/CloudflareSpeedTest-master/releases/cfst_linux_amd64/result.csv`，已拷贝为解析器测试夹具）：
 
 ```text
 IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码
-1.0.0.1,4,4,0.00,12.34,15.67,LAX
+104.21.88.54,4,4,0.00,103.36,65.78,HKG
+104.25.250.92,4,4,0.00,100.84,64.35,HKG
 ```
 
 - 解析器必须跳过表头、按列索引取 IP；文件不存在 / 只有表头视为"优选 IP 为空"，按 [ARCHITECTURE.md](ARCHITECTURE.md) §7 中止写入。
@@ -131,7 +134,8 @@ IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区�
 
 | 命令 | 说明 |
 | --- | --- |
-| `run` | 执行一次完整流水线（P0 唯一核心命令） |
+| `run` | 执行一次完整流水线（核心命令；M1–M4 仅 dry-run，`--apply` 属 M5–M6） |
+| `export` | 从状态库导出 `domains.csv` / `rewrites.csv`（`-o` 指定输出目录，只读） |
 | `version` | 打印版本 |
 
 ### 7.2 `run` 主要 flags
@@ -145,14 +149,18 @@ cf-opt-adguard run \
   --agh-pass '********' \      # 或配置中 ${AGH_PASSWORD} 环境变量展开
   --window 7d \
   --min-hits 20 \
-  --cfip-source domain:cfip.yyyyt.top \
+  --cfip-source cfst:result.csv \   # 默认值；release 二进制放 CFST 目录执行可省略；也可选 domain:HOST / static:PATH（D17）
+  --db-path ./data/state.db \
   --log-level info
 
-# 核对计划无误后，显式 --apply 才真正写入
+# 核对计划无误后，显式 --apply 才真正写入（M5–M6 前传入恒报错，退出码 2）
 cf-opt-adguard run -c config.yaml --apply
+
+# 状态库导出查看
+cf-opt-adguard export -c config.yaml -o ./out
 ```
 
-- 同名 flag 覆盖配置文件值（D13）。
+- 同名 flag 覆盖配置文件值（D13）；实际 flags 以 `cf-opt-adguard run --help` 为准。
 - **默认 dry 模式**：只产出计划，绝不调写接口；显式 `--apply` 进入 live 模式执行写入（D10）。cron / systemd timer 任务必须显式带 `--apply`。
 - 计划输出固定包含：采集条数、候选数、confirmed 数、优选 IP、add/update/remove 计数与逐条 `domain → answer` 清单，以及 `[DRY-RUN]` / `[APPLY]` 模式标识。
 

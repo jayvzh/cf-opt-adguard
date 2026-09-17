@@ -40,12 +40,13 @@
 - **原因**：否则 CNAME / CIDR 信号是自我印证的循环结论，误判率无法控制。
 - **影响**：`detector.resolvers` 成为必填配置；ipselector 解析优选域名同样走该 resolver。
 
-## D6 ｜ 2026-09-17 ｜ 默认精确域名聚合，zone / 通配显式开启
+## D6 ｜ 2026-09-17 ｜ 默认精确域名聚合，zone / 通配显式开启（部分被 D14 修订）
 
 - **背景**：按根域重写一条可覆盖全部子域，但同根域下常有非 CF 子域。
 - **决策**：默认仅对 confirmed 的精确域名写规则；`aggregate.mode=zone` 与 `sync.wildcard` 都是独立开关，默认关闭。
 - **原因**：规则污染的代价（站点解析异常）高于少覆盖几个域名；PRD 将污染列为主要风险。
 - **影响**：规则条数更多；planner 的 remove 集合严格限定在本工具写入过的精确域名。
+- **2026-09-17 修订（D14）**：默认改为一级域（zone）混合归并 + 证据不足自动回退精确；"防污染优先"的原则保留（回退规则正是该原则的体现），`aggregate.mode: exact` 仍可整体退回逐 host 精确旧行为。
 
 ## D7 ｜ 2026-09-17 ｜ 状态用 SQLite，纯函数核心 + 薄 IO 外壳
 
@@ -53,12 +54,13 @@
 - **原因**：CLI 每次退出，状态必须外存；纯函数核心让最容易出错的统计 / 判定 / 差异逻辑可用表驱动测试覆盖，不依赖网络与真实 AGH。
 - **影响**：包结构按"阶段纯逻辑 + adguard/state 外壳"切分（PROJECT_STRUCTURE）；时间相关逻辑必须注入时钟。
 
-## D8 ｜ 2026-09-17 ｜ CloudflareSpeedTest 只做外部依赖，不重造测速
+## D8 ｜ 2026-09-17 ｜ CloudflareSpeedTest 只做外部依赖，不重造测速（部分被 D17 修订）
 
 - **背景**：CFST 已成熟实现延迟 / 丢包 / 下载测速与 IP 段下载。
 - **决策**：来源 B 通过调用外部二进制 + 解析结果文件（CSV）集成，本仓库内嵌的 CFST 源码仅作格式参考。
 - **原因**：测速算法维护成本高且非本工具核心价值；CSV 是稳定的外部契约。
 - **影响**：来源 B 需要用户自行提供二进制；文件缺失 / 结果为空按"优选 IP 为空"安全中止。
+- **2026-09-17 修订（D17）**：来源 B 升格为**默认来源**；"调用外部二进制测速"环节在 MVP 不实现，本工具只读用户自行测速后产出的 `result.csv`，自动调用推迟到 P1。
 
 ## D9 ｜ 2026-09-17 ｜ 定名 cf-opt-adguard
 
@@ -90,3 +92,38 @@
 - **决策**：`config.yaml` 承载主体配置，同名 CLI flag 覆盖文件值，密码支持 `${ENV_VAR}` 从环境变量展开。
 - **原因**：多 resolver / 过滤列表等复杂结构用文件表达；flags 便于 cron 临时覆盖；密码不入库且不必明文落盘。
 - **影响**：仓库只提供 `config.example.yaml`，真实 `config.yaml` 忽略；用户提供的 config.yaml 是 D11 的实测来源。
+
+## D14 ｜ 2026-09-17 ｜ 域名归并默认一级域混合 + 证据不足自动回退精确（部分修订 D6）
+
+- **背景**：D6 的"默认逐 host 精确"在真实日志下规则条数爆炸（同一站点十几个子域各一条）；而全量 zone 通配又有污染风险。
+- **决策**：`aggregate.mode` 默认 `zone`：按公共后缀表把达阈 host 归并到可注册域后**逐 zone 混合决策**（`aggregate.ResolveTargets` 纯函数）：
+  1. zone 内仅 1 个达阈 host → 单条精确（裸域或子域；单 host 证据不足以断言整个 zone，且避免通配误伤未观测子域如 `mx`）；
+  2. zone 内 ≥2 个达阈 host **全部** confirmed 且 `sync.wildcard: true` → `zone` + `*.zone` 两条；
+  3. 混入 maybe / not_cf 达阈 host（或禁用通配）→ 该 zone 回退为逐 confirmed host 精确条目；
+  4. verdict 缺失按 not_cf 保守处理；`maybe` 一律不入目标；`aggregate.mode: exact` 整体退回逐 host 精确。
+- **原因**：归并只在"同一 zone 下多个独立 host 都被探测确认"时发生，等于用探测证据给通配背书；任何证据混杂立即回退，防污染原则与 D6 一致。
+- **影响**：修订 D6 结论（D6 的 exact 路径保留为 `aggregate.mode: exact`）；目标条目输出按 Domain 字典序稳定排序；通配条目以 `*.` 前缀域名参与 planner diff 与 AGH rewrite（真实实例行为待实测，见计划 §7）。
+
+## D15 ｜ 2026-09-17 ｜ 状态库容量护栏：domains ≤1000、runs ≤60，超限按 last_seen 淘汰最旧
+
+- **背景**：CLI 长期无人值守运行，状态库若无限增长会在 NAS / 路由器小盘设备上出问题。
+- **决策**：查询日志原文永不入库；`domains` 上限 1000 行（`aggregate.max_domains`，兼作探测预算上限）、`runs` 只留最近 60 次；rewrites / probes 与目标集合对齐不单独设限。超限按 `last_seen` 淘汰最旧行并打 slog warn。
+- **原因**：域名统计和运行审计是仅有的两张"只增"表，last_seen 淘汰语义自然（久未出现的域名本就该被遗忘）；库体积预期 <5MB。
+- **影响**：清理逻辑集中在 state 包启动时执行；被淘汰域名若再次出现按新域名重新累计。
+
+## D16 ｜ 2026-09-17 ｜ CF 判定自研三信号，cdncheck 不进依赖、仅作人工核对工具
+
+- **背景**：`cdncheck`（projectdiscovery）内置大量 CDN 网段可作现成判定库，但引入后判定逻辑黑盒化且依赖膨胀。
+- **决策**：CF IP 段判定用官方端点自研（CIDR 信号 ~40 行，打分设计不变）；cdncheck 二进制仅作人工交叉核对工具，不作为流水线组件、不进 go.mod。
+- **原因**：本工具只判 CF 一家，官方 `client/v4/ips` 端点 + 本地缓存足够且可审计；三信号打分是核心逻辑，必须自己掌控。
+- **影响**：go.mod 不出现 cdncheck；需要交叉核对时手动运行其二进制比对结果，差异登 pitfalls。
+
+## D17 ｜ 2026-09-17 ｜ 优选 IP 默认来源 B（只读 CFST 结果文件），release 二进制随 CFST 目录部署，MVP 不做自动测速
+
+- **背景**：原设计默认来源 A（解析优选域名），来源 B 含"调用外部二进制测速 + 读结果文件"两步；实际使用习惯是用户自行在 CFST 发布目录手动测速，且自动测速耗时长、参数与 IP 段文件管理复杂。
+- **决策**：
+  1. `cfip.source` 默认由 A 改为 **B**：默认值 `cfst:result.csv`（相对于进程工作目录）；A 优选域名 / C 静态列表保留，但必须显式配置才启用。
+  2. **部署约定**：用户把 release 的 `cf-opt-adguard` 二进制放入 CFST 发布目录（与 `cfst` 可执行文件、`result.csv` 同级，如 `references/CloudflareSpeedTest-master/releases/cfst_linux_amd64/` 的目录形态）执行；测速由用户自行运行 CFST 产出 `result.csv`，本工具只读取。
+  3. **MVP 不实现自动测速**：不 exec / 拉起 `cfst` 二进制，不拼测速参数；自动调用测速 / 定时调度测速仍为 P1（PRD §5.2）。
+- **原因**：同目录部署使默认路径零配置；读 CSV 是稳定、可离线夹具测试的外部契约；自动测速与本工具核心链路解耦，推迟不影响 MVP 价值。
+- **影响**：部分修订 D8；PRD F4 / §6、ARCHITECTURE §3 / §4.4、API §6 / §7.2、DATA_MODEL §4（`cfip.source` 默认值）同步；`config.Default()` 的 `cfip.source` 需在实现时设为 `cfst:result.csv`；`result.csv` 缺失 / 只有表头仍按"优选 IP 为空"安全中止（退出码 2，不写不删）；开发期以 `references/` 下真实 `result.csv` 作只读夹具，拷贝进各包 `testdata/` 使用。

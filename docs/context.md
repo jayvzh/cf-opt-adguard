@@ -11,12 +11,9 @@
 
 ## 2. 当前状态（2026-09-17）
 
-- **阶段：未开工 / 文档骨架刚完成**。仓库内无任何 Go 代码，尚未 `go mod init`，尚未初始化 git。
-- 本机环境：Go 1.27.1（linux/amd64）。
-- 已有材料：
-  - [PRD.md](PRD.md)：v0.2，已按文档规范重构为纯产品视角；
-  - L2 设计文档一套（架构 / 结构 / 数据模型 / API / 开发总则 / 四件套），均为**设计稿**，实现时以代码核实回填；
-  - `references/`：文档规范样板、AlbumShelf 文档样例、两份参考代码（见下）。
+- **阶段：M1–M4（P0 dry-run 全链路）已实现**——collector → aggregate → detector → ipselector → planner → pipeline dry-run 打印全部落地并通过 `go build / vet / test` 与 httptest 集成测试；`syncer` / `verifier` 属 M5–M6 待建，当前 `--apply` 恒以退出码 2 报错。
+- 本机环境：Go 1.27.1（linux/amd64）；module path `cf-opt-adguard`。
+- 文档状态：PRD v0.3（D17）；ARCHITECTURE / DATA_MODEL / PROJECT_STRUCTURE 已与代码核实对齐；决策记录至 D17（含 D14 域名归并、D15 容量护栏、D16 cdncheck 不集成）。
 - 接口关键事实已于 2026-09-17 对 AGH master 源码 + OpenAPI 与 vendored CFST 源码取证，见 [API.md](API.md) §1.1。
 
 ## 3. references/ 目录的角色（只读，不参与构建）
@@ -26,18 +23,18 @@
 | `references/开发文档规范标准.md` | 三层文档体系规范 | 维护文档时遵守 |
 | `references/docs/` | AlbumShelf 项目的文档落地样例 | 格式参考，内容与本项目无关 |
 | `references/CloudflareSpeedTest-Adguard-Script-main/` | 社区单域名同步脚本（Go） | AGH 登录 / 旧 user_rules 通道的事实参考，**其方案不采用**（见 [decisions.md](decisions.md) D3） |
-| `references/CloudflareSpeedTest-master/` | CloudflareSpeedTest 源码 | 来源 B：结果文件格式与调用方式参考 |
+| `references/CloudflareSpeedTest-master/` | CloudflareSpeedTest 源码与发布目录 | 来源 B（**默认来源**，D17）：结果文件格式参考 + 开发期 `result.csv` 真实夹具；MVP 只读取测速结果、不调用其二进制 |
 
-## 4. 下一步（首个里程碑建议顺序）
+## 4. 下一步（M5–M6：live 写入与验证）
 
-1. 定名 + `git init` + `go mod init`；
-2. `config` 与 `adguard` 客户端（先只读：status / querylog / rewrite list，配 httptest 夹具）；
-3. `aggregate` + `detector` 纯函数核心与单测（先跑通 dry-run 全链路）；
-4. `ipselector`（先只做来源 A）+ `planner` + `state`；
-5. 最后接 `syncer` / `verifier` 的 live 写入；
-6. 里程碑收尾：把设计稿中的"待核实"逐项与实测核对，更新文档版本号去掉"设计稿"标注。
+1. ~~定名 + `git init` + `go mod init`~~（已完成）；
+2. ~~`config` 与 `adguard` 客户端（只读）~~（已完成）；
+3. ~~`aggregate` + `detector` 纯函数核心与单测，跑通 dry-run 全链路~~（已完成）；
+4. ~~`ipselector`（默认来源 B：只读 CFST `result.csv`，D17）+ `planner` + `state`~~（已完成）；
+5. `syncer` / `verifier` 落地 live 写入与回查验证（写端点封装、限速重试、逐条结果；通配条目对真实实例的行为需用户授权后实测）；
+6. 里程碑收尾：用户 `config.yaml` 指向的真实实例做一次只读 dry-run 核对，`--apply` live 验证须用户明确授权。
 
-## 5. 开放问题（2026-09-17 已全部拍板，详见 [decisions.md](decisions.md) D9~D13）
+## 5. 开放问题（2026-09-17 已全部拍板，详见 [decisions.md](decisions.md) D9~D17）
 
 1. ~~项目名称~~ → 定名 **cf-opt-adguard**；Go module path 留到 git init 时按仓库地址确定（D9）。
 2. ~~安全默认~~ → **默认 dry-run，显式 `--apply` 才写入**（D10）。

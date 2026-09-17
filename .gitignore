@@ -24,3 +24,8 @@ go.work
 references/
 .env
 config.yaml
+
+# cf-opt-adguard 运行产物
+data/
+*.db
+/result*.csv

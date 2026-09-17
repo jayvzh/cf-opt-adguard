@@ -1,0 +1,22 @@
+{
+  "oldest": "2026-09-10T00:00:00Z",
+  "data": [
+    {
+      "question": { "host": "assets.example.com", "type": "A", "class": "IN" },
+      "answer": [
+        { "type": "A", "value": "104.16.1.2", "ttl": 60, "name": "assets.example.com" }
+      ],
+      "reason": "NotFilteredNotFound",
+      "client": "192.168.1.50",
+      "time": "2026-09-17T08:00:00.000Z",
+      "elapsedMs": "12.3"
+    },
+    {
+      "question": { "host": "www.example.org", "type": "AAAA", "class": "IN" },
+      "reason": "NotFilteredNotFound",
+      "client": "192.168.1.51",
+      "time": "2026-09-17T08:00:05.000Z",
+      "elapsedMs": "8.1"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # cf-opt-adguard 目录职责与模块边界（PROJECT_STRUCTURE.md）
 
-> 版本：v0.1 ｜ 状态：目标结构设计稿（代码尚未创建）。首个里程碑只建 P0 链路所需文件，禁止预实现 P1 / P2 模块。
+> 版本：v0.2 ｜ 状态：M1–M4（P0 dry-run 全链路）已实现，本文已与代码核实对齐；`syncer` / `verifier` 属 M5–M6 待建。禁止预实现 P1 / P2 模块。
 > 本文只回答：放哪——目录职责、包边界、阶段间数据流。运行机制见 [ARCHITECTURE.md](ARCHITECTURE.md)，表结构见 [DATA_MODEL.md](DATA_MODEL.md)。
 > 相关：[ARCHITECTURE.md](ARCHITECTURE.md)、[DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md)。
 > 更新时机：新增 / 重命名 / 移动包，或阶段间数据流变化时（同步检查本文与依赖矩阵）。
@@ -13,28 +13,28 @@
 cf-opt-adguard/
 ├── cmd/
 │   └── cf-opt-adguard/
-│       └── main.go              # 仅 config.Load() → pipeline.Run()，禁止写业务
+│       └── main.go              # 已实现：run / version / export 子命令装配与退出码，禁止写业务
 ├── internal/
-│   ├── config/                  # 配置加载：flags + config 文件 + 默认值
-│   ├── pipeline/                # run 编排：按序调用各阶段、汇总运行结果
-│   ├── collector/               # F1：querylog 分页拉取与过滤
-│   ├── aggregate/               # F2：归一化 + 频次统计（纯函数）
-│   ├── detector/                # F3：resolver / cidr / httphead / 打分（打分纯函数）
-│   ├── ipselector/              # F4：优选 IP 三来源
-│   ├── planner/                 # F6：现状对比，产出 add/update/remove 计划（纯函数）
-│   ├── syncer/                  # F5：执行 AGH rewrite 写操作（全工程唯一写侧）
-│   ├── verifier/                # F8：经 AGH 回查 DNS 验证
-│   ├── adguard/                 # AGH HTTP 客户端：auth / querylog / rewrite 端点封装
-│   ├── state/                   # SQLite 仓储、迁移、状态枚举
+│   ├── config/                  # 已实现：YAML + flags 覆盖 + ${ENV} 展开 + 默认值
+│   ├── pipeline/                # 已实现：run 编排（dry-run 全链路）
+│   ├── collector/               # 已实现：F1：querylog 分页拉取与过滤
+│   ├── aggregate/               # 已实现：F2：归一化 + PSL 归并 + ResolveTargets 混合决策（D14）
+│   ├── detector/                # 已实现：F3：resolver / cidr / httphead / 打分（打分纯函数）
+│   ├── ipselector/              # 已实现：F4：优选 IP 三来源（默认读 CFST result.csv，D17）
+│   ├── planner/                 # 已实现：F6：现状对比，产出 add/update/remove 计划（纯函数）
+│   ├── syncer/                  # M5–M6 待建：F5：执行 AGH rewrite 写操作（全工程唯一写侧）
+│   ├── verifier/                # M5–M6 待建：F8：经 AGH 回查 DNS 验证
+│   ├── adguard/                 # 已实现（只读）：auth / querylog / rewrite list；写端点封装随 M5 补齐
+│   ├── state/                   # 已实现：SQLite 仓储、迁移（migrations/0001_init.sql 定稿）、容量护栏（D15）
 │   └── (notify/ P1 再建，MVP 不允许出现)
-├── config.example.yaml          # 配置模板（不含真实密码）
+├── config.example.yaml          # 已实现：配置模板（不含真实密码，D17 已同步）
 ├── scripts/                     # 按需建立：构建 / 发布辅助（非必需不预置）
 ├── docs/                        # 本目录
 ├── references/                  # 只读参考材料（规范、上游样例、CFST 源码），不参与构建
 └── README.md
 ```
 
-> 项目 / 二进制名已定：`cf-opt-adguard`（D9），即 `cmd/cf-opt-adguard/`；Go module path 在 `go mod init` 时按实际仓库地址确定，之后包导入路径一次对齐。
+> 项目 / 二进制名已定：`cf-opt-adguard`（D9），即 `cmd/cf-opt-adguard/`；Go module path 已定为 `cf-opt-adguard`。
 
 ## 2. 包职责边界
 
@@ -79,7 +79,7 @@ cf-opt-adguard/
 | collector | AGH 连接配置、时间窗口、客户端 / 域名过滤配置 | 原始查询条目流（host、类型、时间、client、reason） |
 | aggregate | 原始条目、聚合粒度、阈值 | 候选域名集合（domain、zone、hits、first/last seen） |
 | detector | 候选集合、resolver / CIDR 缓存、HTTP 配置 | 探测结果（逐信号明细 + 三态结论 + 分数） |
-| ipselector | 来源配置（domain / cfst / static） | 优选 IP 列表（区分 v4/v6）；为空则中止 |
+| ipselector | 来源配置（cfst 默认 / domain / static；cfst 只读结果文件，不调用二进制，D17） | 优选 IP 列表（区分 v4/v6）；为空则中止 |
 | planner | confirmed 集合 + 状态库托管集合 + AGH rewrite 现状 + 优选 IP | 不可变计划：add[] / update[] / remove[] |
 | syncer | 计划、dry-run 标志 | 逐条执行结果（成功 / 失败 + 原因） |
 | verifier | 已执行计划 | 每域名验证结果 |
@@ -87,9 +87,9 @@ cf-opt-adguard/
 
 ## 5. 入口与装配约束
 
-- `main.go` 固定三步：`config.Load() → pipeline.New(依赖).Run(ctx) → 按退出码退出`。
-- 依赖组装集中在 `pipeline`（或首个里程碑设立的 `internal/app`）中完成，避免 main 膨胀。
-- CLI 用标准库 `flag` 或保持子命令解析轻量；命令契约以 [API.md](API.md) §7 为准。
+- `main.go` 已实现为子命令分发：`run`（config.Load → 依赖装配 → pipeline.Run → 按退出码退出）、`version`、`export`（只读导出 CSV）；禁止在 main 写业务。
+- 依赖组装集中在 `main.go` 的 run 子命令装配处完成，避免业务包互相感知构造细节。
+- CLI 用标准库 `flag` 子命令解析；命令契约以 [API.md](API.md) §7 为准（M5–M6 前仅此三个子命令）。
 
 ## 6. 可测试性约束
 

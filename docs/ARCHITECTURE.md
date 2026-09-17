@@ -1,6 +1,6 @@
 # cf-opt-adguard 技术架构与运行机制（ARCHITECTURE.md）
 
-> 版本：v0.1 ｜ 状态：设计稿（项目尚未开工；本文源自 PRD 与对 AGH 官方源码 / 参考仓库的取证，实现后必须以代码核实并回填实际差异）
+> 版本：v0.2 ｜ 状态：M1–M4 已实现（collector → pipeline dry-run 全链路落地，本文已与代码核实对齐）；syncer / verifier 属 M5–M6 待建，其行为描述仍为设计稿。
 > 本文只回答：怎么跑——分层依赖、流水线机制、探测打分、同步与调度、失败处理。接口字段归 [API.md](API.md)，表结构归 [DATA_MODEL.md](DATA_MODEL.md)，目录落位归 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)。
 > 相关：上游 [PRD.md](PRD.md)；选型理由 [decisions.md](decisions.md)；已知坑 [pitfalls.md](pitfalls.md)。
 > 更新时机：流水线阶段、核心机制、技术选型、同步 / 调度 / 失败策略变化时。
@@ -30,13 +30,13 @@ AGH Query Log API
 confirmed_cf 域名列表（maybe / not 仅落状态库）
       │
       ▼
-[ipselector 优选 IP] domain 解析 / CloudflareSpeedTest 结果 / 静态列表
+[ipselector 优选 IP] CloudflareSpeedTest 结果文件（默认）/ domain 解析 / 静态列表
       │
       ▼
 [planner 计划器] AGH 现有 rewrite + 本地状态 → add/update/remove 计划（纯函数）
       │
       ▼
-[syncer 同步器] 唯一写侧：调用 AGH Rewrite API（dry-run 时只打印不执行）
+[syncer 同步器] 唯一写侧：调用 AGH Rewrite API（M5–M6 待建；当前版本 dry-run 只打印不执行）
       │
       ▼
 [verifier 验证器] 经 AGH 回查解析结果，标记失败条目
@@ -61,6 +61,7 @@ confirmed_cf 域名列表（maybe / not 仅落状态库）
 - **单次运行**：`cf-opt-adguard run` 跑完流水线即退出，由外部 cron / systemd timer 周期触发（P0 推荐形态）。
 - **两种模式**：默认 `dry`（只打印计划）；显式 `--apply` 才进入 `live` 执行写入（D10）。两种模式走完全相同的计划管线，差异仅在 syncer 是否执行写调用。
 - 内置定时调度属于 P1；在此之前不允许在进程内常驻循环。
+- **部署约定（默认来源 B，D17）**：release 单二进制放入 CloudflareSpeedTest 发布目录（与 `cfst` 可执行文件、`result.csv` 同级）执行，默认直接读取该目录下用户自行测速产出的 `result.csv`；MVP 不调用 CFST 二进制测速。
 
 ## 4. 各阶段机制
 
@@ -75,18 +76,23 @@ confirmed_cf 域名列表（maybe / not 仅落状态库）
 ### 4.2 aggregate（聚合，纯函数）
 
 - 归一化：转小写、去尾点；IDN 统一转 punycode 存储（展示时还原 Unicode）。
-- 两级粒度：
-  - **精确域名**（默认）：`assets.example.com` 独立计数；
-  - **可注册域**（需显式开启）：借助公共后缀表归并到 `example.com`；公共后缀表数据作为静态资源随程序分发。
-- 每条记录维护：查询次数、首次出现、最后出现（窗口内）。
+- host 级频次统计 + **公共后缀表归并**（`golang.org/x/net/publicsuffix`，随依赖分发、离线可用）：每个 host 记录其可注册域（zone），维护查询次数、首次出现、最后出现（窗口内）。
 - 阈值入候选（默认值见 [PRD.md](PRD.md) §6）：24h ≥ 20 次或 7d ≥ 50 次。阈值为配置项，不允许散落在代码中（集中在 config 默认值）。
+- **目标条目决策（D14，`ResolveTargets` 纯函数）**：探测结论产出后，按可注册域分组逐 zone 混合决策 rewrite 目标：
+  1. zone 内仅 1 个达阈 host → 单条精确（证据不足以通配，含"仅裸域套 CDN"场景）；
+  2. zone 内 ≥2 个达阈 host 全部 confirmed 且 `sync.wildcard: true` → `zone` + `*.zone` 两条；
+  3. 混入 maybe / not_cf（或禁用通配）→ 该 zone 回退逐 confirmed host 精确；
+  4. verdict 缺失按 not_cf 保守处理；`maybe` 一律不入目标。
+  - `aggregate.mode: exact` 整体退回逐 host 精确（D6 旧行为）；输出按 Domain 字典序稳定排序。
 
 ### 4.3 detector（Cloudflare 探测）
 
-对每个候选域名采集三类信号：
+**探测对象**：每个 zone 的裸域 + 每个达阈 host（zone 归并决策依赖裸域结论，D14）。
+
+对每个探测对象采集三类信号：
 
 1. **CNAME 链**：用独立 resolver 追完整 CNAME 链，命中 `cloudflare.net` / `cloudflare.com` / `cdn.cloudflare.net` 后缀。
-2. **IP 段**：最终 A / AAAA 是否落在 Cloudflare 官方 CIDR 内。CIDR 列表启动时从官方端点拉取并本地缓存（端点见 [API.md](API.md) §5），缓存文件可离线复用，拉取失败时用缓存继续。
+2. **IP 段**：最终 A / AAAA 是否落在 Cloudflare 官方 CIDR 内。CIDR 列表启动时从官方端点拉取并缓存到 `data/cf_ips.json`（7 天新鲜期，端点见 [API.md](API.md) §5），拉取失败降级用缓存，缓存也无则该信号缺失（不单独决定结论）。
 3. **HTTP 头**：HEAD（失败降级 GET 只读头部）请求 `https://<domain>`，检查 `cf-ray`、`server: cloudflare`、`cf-cache-status`。
 
 打分规则（权重为业务护栏，改动需同步 PRD）：
@@ -100,29 +106,30 @@ confirmed_cf 域名列表（maybe / not 仅落状态库）
 
 - 总分 ≥ 4 → `confirmed_cf`；有信号但未达线 → `maybe_cf`（只记录不写入）；无信号 → `not_cf`。
 - HTTP 探测失败（超时 / 非 2xx / TLS 失败）按"该信号缺失"处理，不直接判死；DNS 解析失败为 `not_cf` 并记录原因。
-- 并发受控（可配上限，默认保守值）、单请求超时、失败不拖垮整批；探测信号逐项落状态库，保证结论可追溯。
+- 并发受控（默认 8，可配）、单请求超时（默认 3s）、失败不拖垮整批；探测信号逐项落状态库，保证结论可追溯；探测总量受 `aggregate.max_domains` 预算护栏约束（D15）。
 
 ### 4.4 ipselector（优选 IP）
 
-三种来源（配置择一，默认 A）：
+三种来源（配置择一，**默认 B**，D17）：
 
+- **B CloudflareSpeedTest（默认）**：读取 CFST 运行后产出的结果文件（默认 `result.csv`，相对于工作目录；release 约定把本工具二进制放入 CFST 发布目录执行，文件格式见 [API.md](API.md) §6）。CSV 已按丢包 / 延迟、下载速度排序，首数据行即最优 IP。**MVP 只解析文件，不调用 / 拉起 `cfst` 二进制测速**——测速由用户自行运行；自动调用测速为 P1（见 [PRD.md](PRD.md) §5.2）。
 - **A 优选域名**：用独立 resolver 解析（如 `cfip.yyyyt.top`）得到 IP 列表；多 IP 时默认取延迟最低，可配轮询。
-- **B CloudflareSpeedTest**：调用外部二进制测速后读取其结果文件（文件格式见 [API.md](API.md) §6）；本工具不重新实现测速。
 - **C 静态列表**：读取用户维护的 IP 文件，每行一个 IPv4 / IPv6。
 
 要求：
 
-- 明确区分 IPv4 / IPv6，按配置决定下发哪一族（默认两族都下，AGH rewrite answer 单条只放一个地址）。
+- 明确区分 IPv4 / IPv6，按配置决定下发哪一族（默认仅 `[4]`；v6 需 CFST 另跑 ipv6 测速后显式开启，AGH rewrite answer 单条只放一个地址）。
 - **优选 IP 结果为空时中止本次写入**，保留 AGH 现有规则不动（见 §7）。
 
 ### 4.5 planner（计划生成，纯函数）
 
 - 先拉 `GET /control/rewrite/list` 获取 AGH 现状。
-- 托管归属判定：只以"本工具状态库中存在且处于 active/pending 的域名集合"为准；**集合之外的用户手工 rewrite 绝不触碰**。
+- **目标条目 = aggregate.ResolveTargets 的粒度决策产物**（§4.2，D14）：通配条目以 `*.` 前缀域名形态（如 `*.example.com`）与精确条目同键参与 diff。
+- 托管归属判定：只以"本工具状态库中存在且处于 active/pending 的域名集合"为准（本轮 persist 后新登记的 pending 目标即入集合）；**集合之外的用户手工 rewrite 绝不触碰**。
 - 对目标集合计算三类操作：
-  - **add**：confirmed 且 AGH 中不存在；
-  - **update**：AGH 中存在但 answer 与当前优选 IP 不同；
-  - **remove**：状态转为 removed（TTL 到期）或本次重新判定为非 CF 的托管条目。
+  - **add**：目标域名在 AGH 中不存在；
+  - **update**：目标域名存在但现有答案不含本次优选 IP；
+  - **remove**：托管域名在 AGH 中的条目，答案与本次期望不符且属同一 IP 族（异族答案互补共存不清理）；本阶段 remove 只打印不执行。
 - 计划是一份不可变数据结构，默认 dry 模式打印与 `--apply` 后的 live 执行消费同一份计划。
 
 ### 4.6 syncer（同步，唯一写侧）
@@ -161,7 +168,7 @@ confirmed_cf 域名列表（maybe / not 仅落状态库）
 | 触发方式 | 外部 cron / systemd timer，建议每 1~6 小时 |
 | 查询窗口 | 7d（24h / 7d / 30d 可配） |
 | 增量依据 | AGH rewrite list 现状 + 本地状态库 |
-| 优选 IP 变化 | 重新解析后批量 update 受影响条目 |
+| 优选 IP 变化 | 读取最新 `result.csv`（默认 B）/ 重新解析优选域名后批量 update 受影响条目 |
 | 淘汰 | 30d 未出现：active → pending → remove |
 
 每次运行都是幂等重放：即使上一次中途失败，重跑只会补齐差异，不产生重复规则。
