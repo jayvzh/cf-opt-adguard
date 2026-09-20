@@ -1066,8 +1066,25 @@ do_install_cfst() {
     fetch_cfst "$cfst_dir"
 }
 
+# 是否存在仅 root 可清理的残留（定时任务 / 快捷命令 / 指针文件）。
+uninstall_needs_root() {
+    { [ "$SYSTEMD" = 1 ] && { [ -e "/etc/systemd/system/${SERVICE_NAME}.timer" ] \
+        || [ -e "/etc/systemd/system/${SERVICE_NAME}.service" ]; }; } \
+        || [ -e "/etc/cron.d/${SERVICE_NAME}" ] \
+        || [ -e "$MANAGE_BIN" ] || [ -L "$MANAGE_BIN" ] \
+        || [ -e "$POINTER_FILE" ]
+}
+
 do_uninstall() {
+    load_install_dir
     install_dir=${install_dir:-$DEFAULT_INSTALL_DIR}
+    [ -f "$(settings_file)" ] && load_settings
+    ask_defaults   # 解析 cfst_dir（可能配置在安装目录之外）
+    # 非 root 且存在 root 级残留时中止，避免只卸一半留脏文件。
+    if ! is_root && uninstall_needs_root; then
+        _red "检测到定时任务或快捷命令残留，需 root 清理；请用 sudo 重新运行卸载。"
+        return 1
+    fi
     # 交互模式下高危操作先确认（默认取消），并列出将删除的内容；
     # 非交互（CLI / 脚本调用）保持直接执行。
     if [ -t 0 ]; then
@@ -1078,6 +1095,7 @@ do_uninstall() {
         if [ -d "$install_dir" ]; then
             echo "  - 安装目录 $install_dir（含配置、AGH 凭据、状态库与日志）"
         fi
+        _yellow "注: 已同步到 AdGuard Home 的上游规则为远端数据，卸载不会改动。"
         if ! ask_yesno "确认卸载" n; then
             _yellow "已取消卸载"
             return 0
@@ -1091,6 +1109,12 @@ do_uninstall() {
     else
         _yellow "未发现安装目录 $install_dir，仅清理定时任务与快捷命令。"
     fi
+    # cfst 配置在安装目录之外时不删除（独立依赖，可能被其他用途复用），仅提示。
+    case "$cfst_dir" in
+        "$install_dir"|"$install_dir"/*) ;;
+        *) [ -e "$cfst_dir" ] && _yellow "提示: 安装目录外的 cfst 未删除: $cfst_dir（如需可手动清理）" ;;
+    esac
+    return 0
 }
 
 ########################################
@@ -1121,7 +1145,7 @@ menu() {
     echo -e "\033[1;36m  ╔══════════════════════════════════════════════╗"
     echo -e "\033[1;36m  ║\033[0m\033[1;37m        cf-opt-adguard 管理菜单\033[0m\033[1;36m               ║"
     echo -e "\033[1;36m  ╚══════════════════════════════════════════════╝\033[0m"
-    echo -e "\033[1;37m   $APP_NAME\033[0m $ver ｜ 同步间隔 每$(total_hours)h ｜ $sched ｜ $install_dir"
+    echo -e "\033[1;37m   $APP_NAME\033[0m $ver ｜ 同步间隔 每$(total_hours)h ｜ $sched ｜ 安装目录 $install_dir"
     if [ "$installed" = true ]; then
         echo "   上次运行: $(last_run_info)"
     fi
@@ -1156,7 +1180,7 @@ menu() {
     echo "   3. 查看运行日志"
     echo "   4. 定时任务管理（状态/上次运行/暂停/重配间隔/卸载定时）"
     echo -e "\033[1;37m  ── 更新 ───────────────────────────────────\033[0m"
-    echo "   5. 更新主程序"
+    echo "   5. 更新主程序 cf-opt-adguard"
     echo "   6. 更新 CloudflareSpeedTest"
     echo -e "\033[1;37m  ── 配置与卸载 ─────────────────────────────\033[0m"
     echo "   7. 重新配置（AGH/窗口/频次/间隔等）"
