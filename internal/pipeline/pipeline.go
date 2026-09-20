@@ -39,6 +39,9 @@ type Deps struct {
 	Log     *slog.Logger
 	Stdout  io.Writer // 计划打印输出；nil = 不打印
 	DNSAddr string    // verifier 回查 DNS 地址覆盖；空 = 从 cfg.AdGuard.URL 推导（host:53）
+	// Confirm live 写入前确认钩子（交互模式）：返回 false = 用户取消，计划不执行、
+	// 零写操作、退出码 ExitCancelled。nil = 不确认（定时任务 / --yes / 非终端）。
+	Confirm func(planner.Plan) bool
 }
 
 // Stats 一次运行的关键统计（cmd 汇总 / 测试断言）。
@@ -80,6 +83,12 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Stats, int, error)
 			log.Error("补全 runs 审计失败", "err", dbErr)
 		}
 		return st, code, err
+	}
+
+	// 0) AGH 连接预检：只读拉一次 rewrite 列表，尽早暴露地址不可达 / 凭据错误，
+	// 避免跑到采集/探测阶段后才失败（全程无写操作）。
+	if _, err := deps.Client.RewriteList(ctx); err != nil {
+		return fail(ExitError, fmt.Errorf("AGH 连接失败（%s，检查地址/网络/用户名密码）: %w", cfg.AdGuard.URL, err))
 	}
 
 	// 1) CF IP 段（失败降级：CIDR 信号缺失继续跑，CNAME / HTTP 头信号仍有效）
@@ -169,7 +178,18 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Stats, int, error)
 	// 7.5) live：syncer 唯一写侧执行计划 → verifier 经 AGH DNS 回查验证。
 	// dry 模式整段跳过（AGH 写端点与 DNS 查询零调用）。部分失败不中止：
 	// 退出码 4；syncer 致命错误（认证失败 / ctx 取消）→ 运行失败退出码 3。
+	// 交互模式下写入前经 Confirm 钩子确认（列出 CF 域名清单），取消则零写操作收尾。
 	if cfg.Runtime.Apply {
+		if deps.Confirm != nil && !st.Plan.Empty() && !deps.Confirm(st.Plan) {
+			if dbErr := deps.DB.FinishRun(ctx, runID, state.Run{
+				FinishedAt: clock(deps), PreferredIP: st.PreferredIP,
+				Note: "用户在写入确认时取消，未执行同步",
+			}); dbErr != nil {
+				log.Error("补全 runs 审计失败", "err", dbErr)
+			}
+			log.Info("用户取消写入，本轮未对 AdGuard Home 做任何写操作")
+			return st, ExitCancelled, nil
+		}
 		syn := syncer.New(deps.Client, cfg.Sync.RateLimit, cfg.Sync.Retry, log)
 		syncRes, err := syn.Sync(ctx, plan, deps.DB)
 		st.Sync = syncRes

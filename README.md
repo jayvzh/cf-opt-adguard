@@ -35,6 +35,8 @@ cd /opt/cfst                                # cfst 目录：cfst、cf-opt-adguar
 ./cf-opt-adguard run -c config.yaml         # 2. dry-run 核对计划（默认不写入 AGH）
 
 ./cf-opt-adguard run -c config.yaml --apply # 3. 确认无误后写入
+                                            #    终端运行会先列出 CF 域名清单，输入 y 确认写入
+                                            #    （其他输入取消，退出码 5；--yes 可跳过确认）
 ```
 
 
@@ -50,18 +52,31 @@ sudo bash <(curl -sL https://github.com/jayvzh/cf-opt-adguard/raw/refs/heads/mai
 
 安装向导会依次询问：AGH 地址与凭据、统计窗口（24h/7d/30d/2w）、点击频次阈值、运行间隔（一行输入"天 小时"，如 `0 6` = 每 6 小时、`1 0` = 每天）、CFST 目录与测速命令（默认 `./cfst -tl 200 -dn 20`）、独立 resolver；若目录中没有 cfst，会询问是否自动从 [CloudflareSpeedTest 官方 Release](https://github.com/XIU2/CloudflareSpeedTest/releases) 下载最新版（amd64/arm64 自动匹配）。
 
-安装后再次运行同一命令即进入管理菜单：
+安装完成后会额外创建**快捷命令** `cf-opt-adguard`（软链到安装目录内的管理脚本副本，非 root 安装则跳过并提示手动方式），任意目录直接运行即可打开管理菜单：
+
+```bash
+cf-opt-adguard               # 打开管理菜单（首行一行状态：版本 ｜ 同步间隔 ｜ 定时状态 ｜ 安装路径）
+cf-opt-adguard run-sync      # 仅运行同步（使用现有测速结果，跳过 CFST 测速）
+cf-opt-adguard run-once      # 立即跑一轮（测速命令确认 → 配置确认 → 域名清单确认 → 同步）
+cf-opt-adguard logs          # 查看运行日志（run.log 尾部）
+cf-opt-adguard cron          # 定时任务管理（启用状态/上次运行/暂停/重配间隔/卸载定时）
+cf-opt-adguard reconfig      # 修改配置并重载定时任务
+cf-opt-adguard help          # 全部子命令
+```
+
+也可以再次运行安装命令进入同一管理菜单。未安装时菜单只有「安装 / 帮助」两项；已安装后菜单分组如下（首行直接显示一行简单状态信息）：
 
 | 菜单 | 子命令 | 说明 |
 | --- | --- | --- |
-| 1 | `install` | 安装 / 重新安装 |
-| 2 | `run-once` | 立即运行一次（cfst 测速 → 同步） |
-| 3 | `reconfig` | 修改配置并重载定时任务 |
-| 4 | `toggle` | 启用 / 暂停定时任务 |
-| 5 | `status` | 版本 / 定时状态 / 最近日志 |
-| 6 | `update` | 更新主程序二进制 |
-| 7 | `install-cfst` | 安装 / 更新 CloudflareSpeedTest 依赖 |
-| 8 | `uninstall` | 卸载（移除定时任务并删除安装目录） |
+| 1 | `run-sync` | 仅运行同步：使用现有 `result.csv`，跳过 CFST 测速 |
+| 2 | `run-once` | 立即运行一次：测速命令确认（可修改参数）→ 配置确认 → 域名清单确认 → 同步 |
+| 3 | `logs` | 查看运行日志（run.log 尾部，交互可指定行数） |
+| 4 | `cron` | 定时任务管理：显示启用状态与上次运行记录，可暂停/启用、重新配置间隔、卸载定时任务 |
+| 5 | `update` | 更新主程序二进制 |
+| 6 | `install-cfst` | 安装 / 更新 CloudflareSpeedTest 依赖 |
+| 7 | `reconfig` | 重新配置（AGH 地址/凭据、窗口、频次阈值、间隔等）并重载定时任务 |
+| 8 | `uninstall` | 卸载（移除定时任务、快捷命令并删除安装目录） |
+| 9 | `help` | 全部子命令 |
 
 定时任务：systemd 可用时注册 `cf-opt-adguard.service + .timer`（任意小时数精确）；否则回退 `/etc/cron.d/`（仅支持整点整除或整天步长，其他值就近取整并提示）。
 

@@ -158,12 +158,18 @@ cf-opt-adguard run \
 # 核对计划无误后，显式 --apply 才真正写入
 cf-opt-adguard run -c config.yaml --apply
 
+# 终端下 --apply 写入前会列出 CF 域名清单（新增/更新/移除逐条）并要求确认：
+#   输入 y / yes → 执行写入；其他输入或 EOF → 取消（退出码 5，零写操作）
+# 定时任务 / 脚本（非终端）自动跳过确认；也可显式 --yes 跳过：
+cf-opt-adguard run -c config.yaml --apply --yes
+
 # 状态库导出查看
 cf-opt-adguard export -c config.yaml -o ./out
 ```
 
 - 同名 flag 覆盖配置文件值（D13）；实际 flags 以 `cf-opt-adguard run --help` 为准。
 - **默认 dry 模式**：只产出计划，绝不调写接口；显式 `--apply` 进入 live 模式执行写入（D10）。cron / systemd timer 任务必须显式带 `--apply`。
+- **live 写入确认**：终端（stdin 为 TTY）下 `--apply` 在 syncer 执行前列出逐条变更清单并要求确认；取消时计划已落库为 pending、AGH 零写调用、退出码 5。`--yes` 或非终端（cron / 管道 / 重定向）跳过确认，保证无人值守。
 - 计划输出固定包含：采集条数、候选数、confirmed 数、优选 IP、add/update/remove 计数与逐条 `domain → answer` 清单，以及 `[DRY-RUN]` / `[APPLY]` 模式标识。
 
 ### 7.3 退出码（已实现并启用）
@@ -174,3 +180,4 @@ cf-opt-adguard export -c config.yaml -o ./out
 | 2 | 配置 / 参数错误（含必填缺失、优选 IP 为空前置失败） |
 | 3 | 采集 / 探测阶段失败导致未进入同步（AGH 不可达等），未做任何写操作 |
 | 4 | 同步执行但存在失败条目（部分成功，详情见 runs 记录与日志） |
+| 5 | live 写入前用户确认取消（计划已产出并落库 pending，未执行任何写操作） |

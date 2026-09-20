@@ -7,6 +7,10 @@ set -e
 APP_NAME="cf-opt-adguard"
 SERVICE_NAME="cf-opt-adguard"
 DEFAULT_INSTALL_DIR="/opt/cf-opt-adguard"
+# 管理菜单安装位置：脚本自身副本存到安装目录，软链到 PATH 形成快捷命令。
+MANAGE_BIN="/usr/local/bin/${APP_NAME}"
+# 安装位置指针（root 安装时写入，供快捷命令在自定义安装目录时恢复路径）。
+POINTER_FILE="/etc/${APP_NAME}.conf"
 # GitHub releases 拉取基址（构建时 build-release.sh 会重新注入；此处为兜底默认）。
 DEFAULT_RELEASE_BASE_URL="https://github.com/jayvzh/cf-opt-adguard/releases/latest/download"
 # 脚本自身的规范获取地址（用于提示与 curl|bash 场景）。
@@ -20,6 +24,7 @@ install_dir=""
 arg_url=""          # --url 覆盖拉取基址
 skip_schedule=false
 with_cfst=false     # --with-cfst：安装时自动拉取 cfst 依赖
+MANAGE_SHORTCUT_OK=false  # 本次安装是否成功创建快捷命令软链
 
 # 交互答案（parse_args 可预置，do_install 中逐项补默认）
 agh_url=""; agh_user=""; agh_pass=""
@@ -31,6 +36,13 @@ _red()   { echo -e "\033[0;31m$1\033[0m"; }
 _yellow(){ echo -e "\033[0;33m$1\033[0m"; }
 _blue()  { echo -e "\033[0;36m$1\033[0m"; }
 _green() { echo -e "\033[0;32m$1\033[0m"; }
+_white() { echo -e "\033[0;37m$1\033[0m"; }
+# 加粗色（标题/强调用，样式参考 references/install_nodeget.sh）
+_red_bold()   { echo -e "\033[1;31m$1\033[0m"; }
+_yellow_bold(){ echo -e "\033[1;33m$1\033[0m"; }
+_blue_bold()  { echo -e "\033[1;36m$1\033[0m"; }
+_green_bold() { echo -e "\033[1;32m$1\033[0m"; }
+_white_bold() { echo -e "\033[1;37m$1\033[0m"; }
 
 ########################################
 # 环境检测
@@ -150,6 +162,22 @@ ensure_cfst() {
 ########################################
 settings_file() { echo "$install_dir/settings.env"; }
 
+# 未显式 --install-dir 时恢复上次安装路径：先读 /etc 指针文件，再回退默认目录 settings.env。
+load_install_dir() {
+    [ -n "$install_dir" ] && return 0
+    local line id f
+    if [ -r "$POINTER_FILE" ]; then
+        line=$(grep -m1 '^INSTALL_DIR=' "$POINTER_FILE") || true
+        id=${line#INSTALL_DIR=}; id=${id%\'}; id=${id#\'}
+        [ -n "$id" ] && { install_dir=$id; return 0; }
+    fi
+    f="$DEFAULT_INSTALL_DIR/settings.env"
+    [ -f "$f" ] || return 0
+    line=$(grep -m1 '^INSTALL_DIR=' "$f") || return 0
+    id=${line#INSTALL_DIR=}; id=${id%\'}; id=${id#\'}
+    [ -n "$id" ] && install_dir=$id
+}
+
 load_settings() {
     local f; f=$(settings_file)
     [ -f "$f" ] && . "$f" || true
@@ -179,27 +207,46 @@ prompt_answers() {
     if [ ! -t 0 ] && [ -n "$agh_url" ] && [ -n "$agh_pass" ]; then
         _blue "==> 非交互模式，使用命令行参数与默认值"
         validate_answers
+        local code; code=$(check_agh_connection)
+        if [ "$code" != "200" ]; then
+            _red "AGH 连接预检失败（HTTP $code）: $agh_url"
+            [ "$code" = "401" ] || [ "$code" = "403" ] && _yellow "用户名或密码错误。"
+            [ "$code" = "000" ] && _yellow "地址不可达：检查 AGH 地址 / 端口 / 网络。"
+            exit 1
+        fi
+        _green "[ok] AGH 连接正常: $agh_url"
         return
     fi
     echo
-    _blue "—— AdGuard Home 连接 ——"
-    while [ -z "$agh_url" ]; do
-        read -rp "AGH 地址（如 http://192.168.1.2:3000）: " agh_url || { _red "输入流已关闭且未提供 AGH 地址"; exit 1; }
+    _blue_bold "── 1/3 AdGuard Home 连接 ──────────────────"
+    # 问完立即连接预检，失败则重新输入（地址 / 凭据错误尽早暴露）。
+    local code
+    while true; do
+        while [ -z "$agh_url" ]; do
+            read -rp "AGH 地址（如 http://192.168.1.2:3000）: " agh_url || { _red "输入流已关闭且未提供 AGH 地址"; exit 1; }
+        done
+        read -rp "AGH 用户名（默认 $agh_user）: " _u; agh_user=${_u:-$agh_user}
+        if [ -z "$agh_pass" ]; then
+            printf "AGH 密码: "; read -rs agh_pass; echo
+        fi
+        code=$(check_agh_connection)
+        [ "$code" = "200" ] && break
+        _red "AGH 连接预检失败（HTTP $code）: $agh_url"
+        [ "$code" = "401" ] || [ "$code" = "403" ] && _yellow "用户名或密码错误，请重新输入。"
+        [ "$code" = "000" ] && _yellow "地址不可达：检查 AGH 地址 / 端口 / 网络后重新输入。"
+        agh_url=""; agh_pass=""
     done
-    read -rp "AGH 用户名（默认 $agh_user）: " _u; agh_user=${_u:-$agh_user}
-    if [ -z "$agh_pass" ]; then
-        printf "AGH 密码: "; read -rs agh_pass; echo
-    fi
+    _green "[ok] AGH 连接正常: $agh_url"
     read -rp "统计窗口 24h/7d/30d（默认 $window）: " _w; window=${_w:-$window}
 
     echo
-    _blue "—— 聚合与调度 ——"
+    _blue_bold "── 2/3 聚合与调度 ──────────────────────────"
     read -rp "点击频次 min-hits（默认 $min_hits）: " _m; min_hits=${_m:-$min_hits}
     read -rp "运行间隔（天 小时，一行两个数，如 '0 6'=每6小时, '1 0'=每天，默认 $interval_days $interval_hours）: " _d _h
     interval_days=${_d:-$interval_days}; interval_hours=${_h:-$interval_hours}
 
     echo
-    _blue "—— CloudflareSpeedTest ——"
+    _blue_bold "── 3/3 CloudflareSpeedTest ────────────────"
     read -rp "cfst 目录（默认 $cfst_dir）: " _c; cfst_dir=${_c:-$cfst_dir}
     read -rp "cfst 命令（默认 $cfst_cmd）: " _cmd; cfst_cmd=${_cmd:-$cfst_cmd}
     read -rp "独立 resolver，逗号分隔（默认 $resolvers，勿指向本机 AGH）: " _r; resolvers=${_r:-$resolvers}
@@ -219,8 +266,21 @@ validate_answers() {
 
 total_hours() { echo $((interval_days * 24 + interval_hours)); }
 
+# AGH 连接预检：POST /control/login 拿会话（只读），尽早暴露地址不可达/凭据错误。
+# 输出 HTTP 码：200=成功；401/403=凭据错误；000=不可达。
+check_agh_connection() {
+    local code esc_user esc_pass
+    esc_user=$(printf '%s' "$agh_user" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_pass=$(printf '%s' "$agh_pass" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    code=$(curl -sS -m 8 -o /dev/null -w '%{http_code}' -X POST "$agh_url/control/login" \
+        -H 'Content-Type: application/json' \
+        -d "{\"name\":\"$esc_user\",\"password\":\"$esc_pass\"}" 2>/dev/null) || code=000
+    echo "$code"
+}
+
 save_settings() {
     cat > "$(settings_file)" <<EOF
+INSTALL_DIR=$(sh_quote "$install_dir")
 AGH_URL=$(sh_quote "$agh_url")
 AGH_USER=$(sh_quote "$agh_user")
 AGH_PASS=$(sh_quote "$agh_pass")
@@ -415,6 +475,65 @@ remove_schedule() {
 }
 
 ########################################
+# 管理菜单快捷命令：保存脚本副本 + 软链到 /usr/local/bin
+########################################
+manage_sh() { echo "$install_dir/manage.sh"; }
+
+# 把本脚本保存为 $install_dir/manage.sh（curl|bash 场景 $0 为 /dev/fd/*，改从 GitHub 拉取）。
+# 先写临时文件再原子替换，避免覆盖"正在运行的本脚本"导致解析错乱。
+install_manage_script() {
+    local tmp="$(manage_sh).tmp"
+    if [[ "$0" != /dev/fd/* ]] && [ -f "$0" ]; then
+        cp "$0" "$tmp"
+    else
+        _blue "==> 保存管理脚本副本（从 GitHub 拉取）"
+        curl -fsSL "$SCRIPT_URL" -o "$tmp" || {
+            rm -f "$tmp"
+            _yellow "管理脚本副本下载失败，跳过快捷命令安装"
+            return 1
+        }
+    fi
+    chmod 755 "$tmp"
+    mv -f "$tmp" "$(manage_sh)"
+}
+
+# root 时软链 /usr/local/bin/cf-opt-adguard -> manage.sh，形成快捷命令，并记录安装位置指针。
+install_menu_shortcut() {
+    install_manage_script || return 0
+    if is_root; then
+        ln -sf "$(manage_sh)" "$MANAGE_BIN"
+        MANAGE_SHORTCUT_OK=true
+        printf "INSTALL_DIR=%s\n" "$(sh_quote "$install_dir")" > "$POINTER_FILE"
+        chmod 644 "$POINTER_FILE"
+    else
+        _yellow "非 root，未创建快捷命令 $MANAGE_BIN；可用: bash $(manage_sh) 打开管理菜单"
+    fi
+}
+
+remove_menu_shortcut() {
+    if is_root; then
+        rm -f "$MANAGE_BIN" "$POINTER_FILE"
+    fi
+}
+
+shortcut_hint() {
+    if [ "$MANAGE_SHORTCUT_OK" = true ]; then
+        _white_bold "  快捷命令（任意目录可用）:"
+        echo "    $APP_NAME               # 打开本管理菜单"
+        echo "    $APP_NAME run-sync      # 仅运行同步（用现有测速结果）"
+        echo "    $APP_NAME run-once      # 立即跑一轮（分步确认 → 测速 → 同步）"
+        echo "    $APP_NAME reconfig      # 修改配置"
+        echo "    $APP_NAME help          # 全部子命令"
+    else
+        _white_bold "  管理菜单（快捷命令未安装）:"
+        echo "    bash $(manage_sh)"
+    fi
+}
+
+# 完成信息键值对：键白色加粗、值绿色，同一行输出。
+_kv() { printf "  \033[1;37m%-12s\033[0m\033[0;32m%s\033[0m\n" "$1" "$2"; }
+
+########################################
 # 菜单动作
 ########################################
 do_install() {
@@ -441,26 +560,266 @@ do_install() {
     gen_wrapper
     ensure_cfst
     install_schedule
+    install_menu_shortcut
 
     echo
-    _green "✅ 安装完成"
-    _green "  目录: $install_dir"
-    _green "  配置: $install_dir/config.yaml"
-    _green "  包装: $install_dir/run-opt.sh（cfst 测速 → run --apply）"
-    _green "  间隔: 每 $(total_hours) 小时（${interval_days}d ${interval_hours}h）"
-    _green "  日志: $install_dir/logs/run.log"
+    echo "──────────────────────────────────────────────"
+    _green_bold "✅ 安装完成"
+    echo "──────────────────────────────────────────────"
+    _kv "目录" "$install_dir"
+    _kv "配置" "$install_dir/config.yaml"
+    _kv "包装" "$install_dir/run-opt.sh（cfst 测速 → run --apply）"
+    _kv "间隔" "每 $(total_hours) 小时（${interval_days}d ${interval_hours}h）"
+    _kv "日志" "$install_dir/logs/run.log"
+    echo
+    shortcut_hint
+    echo "──────────────────────────────────────────────"
     echo
     _y="n"
     if [ -t 0 ]; then read -rp "是否立即运行一次验证？(y/N): " _y || _y="n"; fi
     if [ "$_y" = "y" ]; then do_run_once; fi
 }
 
+# cfst 命令简单校验：首词为 ./cfst / cfst / 绝对路径 */cfst；参数为 - 开头的选项，
+# 选项后允许紧跟一个非 - 的值（如 -tl 200）；连续两个值或裸值视为非法。
+validate_cfst_cmd() {
+    local cmd="$1" first rest="" w prev_opt=0
+    [ -n "$cmd" ] || return 1
+    first=${cmd%% *}
+    [ "$cmd" != "$first" ] && rest=${cmd#* }
+    case "$first" in
+        ./cfst|cfst|*/cfst) ;;
+        *) return 1 ;;
+    esac
+    for w in $rest; do
+        case "$w" in
+            -*) prev_opt=1 ;;
+            *)
+                [ "$prev_opt" = 1 ] || return 1
+                prev_opt=0 ;;
+        esac
+    done
+    return 0
+}
+
 do_run_once() {
+    load_install_dir
     install_dir=${install_dir:-$DEFAULT_INSTALL_DIR}
-    if [ ! -x "$install_dir/run-opt.sh" ]; then
-        _red "未找到 $install_dir/run-opt.sh，请先执行安装（菜单 1）。"; return 1
+    if [ ! -x "$install_dir/cf-opt-adguard" ]; then
+        _red "未找到 $install_dir/cf-opt-adguard，请先执行安装（菜单 1）。"
+        return 1
     fi
-    bash "$install_dir/run-opt.sh"
+    [ -f "$(settings_file)" ] && load_settings
+    ask_defaults
+    cfst_dir=${cfst_dir:-$install_dir/cfst}
+
+    # —— 1) cfst 路径检测 ——
+    if [ ! -x "$cfst_dir/cfst" ]; then
+        _red "未检测到 CloudflareSpeedTest: $cfst_dir/cfst"
+        _yellow "请先用管理菜单「7. 安装 / 更新 CloudflareSpeedTest」安装，或 --cfst-dir 指定正确目录。"
+        return 1
+    fi
+
+    local interactive=false
+    [ -t 0 ] && interactive=true
+
+    # —— 2) 测速命令确认 / 修改（仅交互模式）——
+    local final_cmd="$cfst_cmd"
+    if [ "$interactive" = true ]; then
+        echo
+        _blue_bold "── 1/3 CFST 测速 ──────────────────────────"
+        echo "  测速目录: $cfst_dir"
+        echo "  测速命令: $cfst_cmd"
+        local loop=1 pick _cmd
+        while [ "$loop" = 1 ]; do
+            read -rp "  回车直接运行 / m 修改命令 / q 取消: " pick || return 1
+            case "${pick:-y}" in
+                y)
+                    loop=0 ;;
+                m|M)
+                    local _cmd
+                    while true; do
+                        read -rp "  输入 cfst 命令（格式同上，如 ./cfst -tl 200 -dn 20）: " _cmd || return 1
+                        if validate_cfst_cmd "$_cmd"; then
+                            final_cmd="$_cmd"
+                            _yellow "  本次运行使用新命令（永久修改请用菜单 3）"
+                            loop=0
+                            break
+                        fi
+                        _red "  命令格式非法：首词须为 ./cfst、cfst 或以 /cfst 结尾的绝对路径，参数为 - 开头的选项（选项后可跟一个值）；请重新输入"
+                    done ;;
+                q|Q)
+                    _yellow "已取消"
+                    return 0 ;;
+                *)
+                    _red "  无效输入（仅支持 回车 / m / q）" ;;
+            esac
+        done
+    fi
+
+    # —— 3) 运行测速（失败即中止，不复用旧 result.csv）——
+    echo "=== $(date '+%F %T') CFST 测速开始: $final_cmd ==="
+    if ! ( cd "$cfst_dir" && eval "$final_cmd" ); then
+        _red "CFST 测速失败，本轮中止。"
+        return 1
+    fi
+    local csv="$cfst_dir/result.csv"
+    if [ ! -f "$csv" ]; then
+        _red "测速结束但未找到结果文件: $csv"
+        return 1
+    fi
+    _green "[ok] 测速完成，结果: $csv"
+
+    # —— 4) 配置确认（仅交互模式）——
+    if [ "$interactive" = true ]; then
+        echo
+        _blue_bold "── 2/3 同步前确认 ─────────────────────────"
+        echo "  配置文件: $install_dir/config.yaml"
+        local go
+        read -rp "  配置无误，继续同步？(Y/n): " go || return 1
+        case "${go:-y}" in
+            n|N)
+                _yellow "已取消；可先用菜单 3 修改配置后再运行"
+                return 0 ;;
+        esac
+    fi
+
+    # —— 5) 同步：交互终端下 Go 端写入前会列出 CF 域名清单，需再次确认；非交互自动 --yes ——
+    echo "=== $(date '+%F %T') 同步开始 ==="
+    local rc=0
+    if [ "$interactive" = true ]; then
+        "$install_dir/cf-opt-adguard" run -c "$install_dir/config.yaml" --apply || rc=$?
+    else
+        "$install_dir/cf-opt-adguard" run -c "$install_dir/config.yaml" --apply --yes || rc=$?
+    fi
+    echo "=== $(date '+%F %T') 同步结束 ==="
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 5 ]; then
+        return "$rc"
+    fi
+    return 0
+}
+
+# 仅运行同步：跳过 CFST 测速，直接用现有 result.csv 写入（交互确认 / 非交互 --yes）。
+do_run_sync() {
+    load_install_dir
+    install_dir=${install_dir:-$DEFAULT_INSTALL_DIR}
+    if [ ! -x "$install_dir/cf-opt-adguard" ]; then
+        _red "未找到 $install_dir/cf-opt-adguard，请先执行安装（菜单 1）。"
+        return 1
+    fi
+    [ -f "$(settings_file)" ] && load_settings
+    ask_defaults
+    cfst_dir=${cfst_dir:-$install_dir/cfst}
+    local csv="$cfst_dir/result.csv"
+    if [ ! -f "$csv" ]; then
+        _red "未找到测速结果 $csv"
+        _yellow "请先运行「立即运行一次」完成 CFST 测速，或检查 --cfst-dir 配置。"
+        return 1
+    fi
+    if [ -t 0 ]; then
+        echo
+        _blue_bold "── 同步前确认 ─────────────────────────────"
+        echo "  配置文件: $install_dir/config.yaml"
+        echo "  测速结果: $csv"
+        local go
+        read -rp "  使用现有测速结果同步？(Y/n): " go || return 1
+        case "${go:-y}" in
+            n|N) _yellow "已取消"; return 0 ;;
+        esac
+    fi
+    echo "=== $(date '+%F %T') 同步开始（跳过测速） ==="
+    local rc=0
+    if [ -t 0 ]; then
+        "$install_dir/cf-opt-adguard" run -c "$install_dir/config.yaml" --apply || rc=$?
+    else
+        "$install_dir/cf-opt-adguard" run -c "$install_dir/config.yaml" --apply --yes || rc=$?
+    fi
+    echo "=== $(date '+%F %T') 同步结束 ==="
+    [ "$rc" -eq 0 ] || [ "$rc" -eq 5 ] && return 0
+    return "$rc"
+}
+
+# 查看运行日志（run.log 尾部）。
+do_logs() {
+    load_install_dir
+    install_dir=${install_dir:-$DEFAULT_INSTALL_DIR}
+    local log="$install_dir/logs/run.log"
+    if [ ! -f "$log" ]; then
+        _yellow "尚无运行日志: $log"
+        return 0
+    fi
+    local n=50
+    if [ -t 0 ]; then
+        read -rp "显示最近多少行？（默认 50）: " n || return 0
+        n=${n:-50}
+        echo "$n" | grep -qE '^[0-9]+$' || { _red "行数须为正整数"; return 1; }
+    fi
+    echo
+    _blue "—— $log（最近 $n 行）——"
+    tail -n "$n" "$log"
+}
+
+# 上次运行记录：systemd 用 timer 的 LastTrigger；否则取 run.log 最后一条标记行。
+last_run_info() {
+    if [ "$SYSTEMD" = 1 ]; then
+        local t
+        t=$(systemctl show "${SERVICE_NAME}.timer" -p LastTriggerUSec --value 2>/dev/null)
+        if [ -n "$t" ] && [ "$t" != "0" ] && [ "$t" != "n/a" ]; then
+            echo "systemd 上次触发: $t"
+            return
+        fi
+    fi
+    local log="$install_dir/logs/run.log"
+    if [ -f "$log" ]; then
+        local last
+        last=$(grep -a '=== ' "$log" | tail -n 1)
+        [ -n "$last" ] && { echo "最近运行标记: $last"; return; }
+    fi
+    echo "暂无运行记录"
+}
+
+# 重新配置运行间隔（定时任务子菜单）：更新 settings / wrapper 并重装定时任务。
+do_reschedule() {
+    local _d _h
+    read -rp "运行间隔（天 小时，如 '0 6'=每6小时, '1 0'=每天，当前 $interval_days $interval_hours）: " _d _h || return 1
+    interval_days=${_d:-$interval_days}; interval_hours=${_h:-$interval_hours}
+    validate_answers
+    save_settings
+    gen_wrapper
+    remove_schedule
+    install_schedule
+    _green "✅ 运行间隔已更新为每 $(total_hours) 小时，定时任务已重载"
+}
+
+# 定时任务管理子菜单：状态 + 上次运行，暂停/启用、重配间隔、卸载定时任务。
+do_cron() {
+    load_install_dir
+    install_dir=${install_dir:-$DEFAULT_INSTALL_DIR}
+    [ -f "$(settings_file)" ] && load_settings
+    ask_defaults
+    while true; do
+        echo
+        _blue_bold "── 定时任务管理 ───────────────────────────"
+        if schedule_enabled; then
+            _green "  状态: 已启用（每 $(total_hours) 小时）"
+        else
+            _yellow "  状态: 未安装/停用（配置间隔: 每 $(total_hours) 小时）"
+        fi
+        echo "  $(last_run_info)"
+        echo
+        echo "  1. 暂停 / 启用 定时任务"
+        echo "  2. 重新配置运行间隔"
+        echo "  3. 卸载定时任务（保留主程序与配置）"
+        echo "  0. 返回主菜单"
+        read -rp "  请输入选项: " c || return 0
+        case "$c" in
+            1) do_toggle ;;
+            2) do_reschedule ;;
+            3) remove_schedule; _green "✅ 定时任务已卸载（主程序与配置保留）" ;;
+            0|q|Q) return 0 ;;
+            *) _red "  无效选项" ;;
+        esac
+    done
 }
 
 do_reconfig() {
@@ -548,11 +907,12 @@ do_install_cfst() {
 do_uninstall() {
     install_dir=${install_dir:-$DEFAULT_INSTALL_DIR}
     remove_schedule
+    remove_menu_shortcut
     if [ -d "$install_dir" ]; then
         rm -rf "$install_dir"
-        _green "✅ 已卸载：定时任务已移除，$install_dir 已删除"
+        _green "✅ 已卸载：定时任务与快捷命令已移除，$install_dir 已删除"
     else
-        _yellow "未发现安装目录 $install_dir，仅清理定时任务。"
+        _yellow "未发现安装目录 $install_dir，仅清理定时任务与快捷命令。"
     fi
 }
 
@@ -560,32 +920,81 @@ do_uninstall() {
 # 菜单 / 参数 / 主循环
 ########################################
 menu() {
+    load_install_dir
+    install_dir=${install_dir:-$DEFAULT_INSTALL_DIR}
+    # 面板信息全部容错：未安装/无配置也能正常进菜单
+    [ -f "$(settings_file)" ] && load_settings
+    ask_defaults   # settings 大写变量 → 业务小写变量（间隔显示用）
+
+    # 一行简单状态：版本｜同步间隔｜定时状态｜安装路径
+    local ver="-" installed=false
+    if [ -x "$install_dir/cf-opt-adguard" ]; then
+        ver=$("$install_dir/cf-opt-adguard" version 2>/dev/null | awk '{print $3}')
+        ver=${ver:-"?"}
+        installed=true
+    fi
+    local sched
+    if schedule_enabled; then
+        sched=$(_green "定时已启用")
+    else
+        sched=$(_yellow "定时未启用")
+    fi
     echo
-    echo "================================"
-    echo "     cf-opt-adguard 管理脚本"
-    echo "================================"
+    echo -e "\033[1;36m  ╔══════════════════════════════════════════════╗"
+    echo -e "\033[1;36m  ║\033[0m\033[1;37m        cf-opt-adguard 管理菜单\033[0m\033[1;36m               ║"
+    echo -e "\033[1;36m  ╚══════════════════════════════════════════════╝\033[0m"
+    echo -e "\033[1;37m   $APP_NAME\033[0m $ver ｜ 同步间隔 每$(total_hours)h ｜ $sched ｜ $install_dir"
+    if [ -x "$MANAGE_BIN" ] || [ -L "$MANAGE_BIN" ]; then
+        echo -e "\033[0;33m   提示: 任意目录运行 $APP_NAME 均可打开本菜单\033[0m"
+    fi
+
+    if [ "$installed" != true ]; then
+        echo
+        echo -e "\033[1;37m  ── 安装 ───────────────────────────────────\033[0m"
+        echo "   1. 安装（二进制 + 配置 + 定时任务 + 快捷命令）"
+        echo
+        echo "   2. 帮助"
+        echo "   0. 退出"
+        echo
+        read -rp "  请输入选项: " choice
+        case "$choice" in
+            1) action="install" ;;
+            2) action="help" ;;
+            0) exit 0 ;;
+            *) return ;;
+        esac
+        dispatch "$action"
+        return
+    fi
+
     echo
-    echo "1. 安装 / 重新安装（含配置与定时任务）"
-    echo "2. 立即运行一次（cfst 测速 → 同步）"
-    echo "3. 修改配置（AGH/窗口/频次/间隔等）"
-    echo "4. 启用 / 暂停 定时任务"
-    echo "5. 查看状态与最近日志"
-    echo "6. 更新主程序二进制"
-    echo "7. 安装 / 更新 CloudflareSpeedTest 依赖"
-    echo "8. 卸载"
+    echo -e "\033[1;37m  ── 同步运行 ───────────────────────────────\033[0m"
+    echo "   1. 仅运行同步（使用现有测速结果，不测速）"
+    echo "   2. 立即运行一次（测速命令确认 → 配置确认 → 同步）"
+    echo -e "\033[1;37m  ── 日志与定时 ─────────────────────────────\033[0m"
+    echo "   3. 查看运行日志"
+    echo "   4. 定时任务管理（状态/上次运行/暂停/重配间隔/卸载定时）"
+    echo -e "\033[1;37m  ── 更新 ───────────────────────────────────\033[0m"
+    echo "   5. 更新主程序"
+    echo "   6. 更新 CloudflareSpeedTest"
+    echo -e "\033[1;37m  ── 配置与卸载 ─────────────────────────────\033[0m"
+    echo "   7. 重新配置（AGH/窗口/频次/间隔等）"
+    echo "   8. 卸载（移除定时任务、快捷命令与安装目录）"
     echo
-    echo "0. 退出"
+    echo "   9. 帮助"
+    echo "   0. 退出"
     echo
-    read -rp "请输入选项: " choice
+    read -rp "  请输入选项: " choice
     case "$choice" in
-        1) action="install" ;;
+        1) action="run-sync" ;;
         2) action="run-once" ;;
-        3) action="reconfig" ;;
-        4) action="toggle" ;;
-        5) action="status" ;;
-        6) action="update" ;;
-        7) action="install-cfst" ;;
+        3) action="logs" ;;
+        4) action="cron" ;;
+        5) action="update" ;;
+        6) action="install-cfst" ;;
+        7) action="reconfig" ;;
         8) action="uninstall" ;;
+        9) action="help" ;;
         0) exit 0 ;;
         *) return ;;
     esac
@@ -623,13 +1032,17 @@ parse_args() {
 dispatch() {
     case "$1" in
         install)   do_install ;;
+        run-sync)  do_run_sync ;;
         run-once)  do_run_once ;;
-        reconfig)  do_reconfig ;;
+        logs)      do_logs ;;
+        cron)      do_cron ;;
         toggle)    do_toggle ;;
-        status)    do_status ;;
+        reconfig)  do_reconfig ;;
         update)    do_update ;;
         install-cfst) do_install_cfst ;;
         uninstall) do_uninstall ;;
+        status)    do_status ;;
+        help)      usage ;;
         *) usage ;;
     esac
 }
@@ -639,15 +1052,20 @@ cat <<EOF
 Usage:
   install.sh [command] [options]
 
+安装成功后，任意目录直接运行 $APP_NAME 即可打开管理菜单（等价于本脚本无参数）。
+
 Commands:
-  install     安装（二进制 + 配置 + 定时任务，缺省进入交互）
-  run-once    立即运行一次（cfst 测速 → 同步）
+  install     安装（二进制 + 配置 + 定时任务 + 快捷命令，缺省进入交互）
+  run-sync    仅运行同步（使用现有测速结果，跳过 CFST 测速）
+  run-once    立即运行一次（测速命令确认 → 配置确认 → 域名清单确认 → 同步）
+  logs        查看运行日志（run.log 尾部）
+  cron        定时任务管理（状态/上次运行/暂停/重配间隔/卸载定时）
   reconfig    修改配置并重载定时任务
   toggle      启用 / 暂停 定时任务
-  status      查看版本 / 定时状态 / 最近日志
   update       更新主程序二进制（保留配置与日志）
   install-cfst 安装 / 更新 CloudflareSpeedTest 到 cfst 目录
-  uninstall   卸载（移除定时任务并删除安装目录）
+  uninstall   卸载（移除定时任务、快捷命令并删除安装目录）
+  status      查看版本 / 定时状态 / 最近日志
   help        本帮助
 
 Options:
@@ -667,6 +1085,8 @@ Options:
 
 示例:
   sudo bash install.sh                        # 交互菜单
+  $APP_NAME                                   # 安装后任意目录打开管理菜单
+  $APP_NAME status                            # 查看状态与最近日志
   sudo bash install.sh install --agh-url http://192.168.1.2:3000 \\
       --agh-pass 'xxx' --interval "1 0"       # 非交互安装
 EOF
@@ -676,6 +1096,7 @@ detect_env
 require_cmds
 if [ $# -gt 0 ]; then
     parse_args "$@"
+    load_install_dir
     dispatch "$action"
 else
     # curl|bash 直管道时 stdin 被下载流占用，无法回答向导，必须引导到进程替换形式。
@@ -687,6 +1108,7 @@ else
         echo "    curl -sL $SCRIPT_URL -o /tmp/cf-opt-install.sh && sudo bash /tmp/cf-opt-install.sh"
         exit 1
     fi
+    load_install_dir
     while true; do
         menu
     done

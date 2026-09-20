@@ -146,9 +146,9 @@ func (f fakeRT) RoundTrip(req *http.Request) (*http.Response, error) {
 		}, nil
 	}
 	return &http.Response{
-		StatusCode:    http.StatusNotFound,
-		Status:        "404 Not Found",
-		Proto:         "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		StatusCode: http.StatusNotFound,
+		Status:     "404 Not Found",
+		Proto:      "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
 		Header:        http.Header{},
 		Body:          io.NopCloser(strings.NewReader("")),
 		ContentLength: 0,
@@ -595,10 +595,10 @@ func liveDeps(t *testing.T, cfg *config.Config, db *state.DB, stdout *strings.Bu
 	return pipeline.Deps{
 		Client: adguard.New(cfg.AdGuard.URL, cfg.AdGuard.Username, cfg.AdGuard.Password,
 			"", 10*time.Second),
-		DB:     db,
-		HC:     &http.Client{Transport: fakeRT{cfAPI: newCFIPEndpoint(t)}},
-		Log:    slog.New(slog.DiscardHandler),
-		Stdout: stdout,
+		DB:      db,
+		HC:      &http.Client{Transport: fakeRT{cfAPI: newCFIPEndpoint(t)}},
+		Log:     slog.New(slog.DiscardHandler),
+		Stdout:  stdout,
 		DNSAddr: dnsAddr,
 	}
 }
@@ -721,4 +721,54 @@ func TestLivePartialFailureExit4(t *testing.T) {
 	mustContain(t, out, "--- 同步失败")
 	mustContain(t, out, probedHost+" → "+preferredIP+"（写入失败（last_error 已落库，下轮重试））")
 	mustContain(t, out, "old.test → 1.0.0.1（移除成功，回查验证通过）")
+}
+
+// TestLiveConfirmCancelled Confirm 钩子返回 false（用户在写入确认时取消）：
+// 退出码 5，AGH 零写调用（add/remove 均未执行），托管状态行不被降级。
+func TestLiveConfirmCancelled(t *testing.T) {
+	cfg, db, stdout, store, dnsAddr := setupLive(t)
+
+	confirmed := false
+	deps := liveDeps(t, cfg, db, stdout, dnsAddr)
+	deps.Confirm = func(p planner.Plan) bool {
+		confirmed = true
+		return false
+	}
+
+	st, code, err := pipeline.Run(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("pipeline.Run: %v", err)
+	}
+	if code != pipeline.ExitCancelled {
+		t.Fatalf("退出码 = %d, 期望 %d\n%s", code, pipeline.ExitCancelled, stdout.String())
+	}
+	if !confirmed {
+		t.Fatal("Confirm 钩子未被调用")
+	}
+
+	// 零写操作：AGH store 仅剩预置 old.test，example.com 未写入。
+	entries := store.list()
+	if len(entries) != 1 || entries[0].Domain != "old.test" {
+		t.Fatalf("取消后 AGH 应保持原状（仅 old.test）: %+v", entries)
+	}
+
+	// 状态库：old.test 仍 active（未执行 remove）；example.com 计划行停留 pending。
+	ctx := context.Background()
+	rwOld, err := db.GetRewrite(ctx, "old.test", "1.0.0.1", 4)
+	if err != nil {
+		t.Fatalf("GetRewrite(old.test): %v", err)
+	}
+	if rwOld.State != "active" || !rwOld.AGHPresent {
+		t.Fatalf("取消后 old.test 应保持 active: %+v", rwOld)
+	}
+	rw, err := db.GetRewrite(ctx, probedHost, preferredIP, 4)
+	if err != nil {
+		t.Fatalf("GetRewrite(example.com): %v", err)
+	}
+	if rw.State != "pending" {
+		t.Fatalf("取消后 example.com 应停留 pending（计划已产出未同步）: %+v", rw)
+	}
+	if st.Sync.OK != 0 || st.Sync.Fail != 0 {
+		t.Fatalf("取消后同步汇总应为零值: %+v", st.Sync)
+	}
 }

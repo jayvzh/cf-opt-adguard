@@ -20,6 +20,7 @@ import (
 	"cf-opt-adguard/internal/adguard"
 	"cf-opt-adguard/internal/config"
 	"cf-opt-adguard/internal/pipeline"
+	"cf-opt-adguard/internal/planner"
 	"cf-opt-adguard/internal/state"
 )
 
@@ -63,7 +64,9 @@ func usage(w io.Writer) {
   cf-opt-adguard help              本帮助
 
 dry-run 绝不调用 AdGuard Home 写端点；--apply 为 live 写入（syncer 唯一写侧，
-部分失败退出码 4），写入后经 AGH DNS 回查验证。
+部分失败退出码 4），写入后经 AGH DNS 回查验证。终端下 --apply 写入前会列出
+CF 域名清单并要求确认（y 继续 / 其他取消，退出码 5）；--yes 或非终端（定时任务）
+跳过确认直接写入。
 `)
 }
 
@@ -80,6 +83,7 @@ func cmdRun(args []string) int {
 	minHits := fs.Int("min-hits", 0, "覆盖聚合命中阈值（同时作用于 24h 与 7d 档）")
 	cfipSource := fs.String("cfip-source", "", "覆盖 cfip.source（默认 cfst:result.csv，D17）")
 	apply := fs.Bool("apply", false, "进入 live 模式：执行计划写入 AGH 并回查验证（默认 dry-run）")
+	yes := fs.Bool("yes", false, "跳过 live 写入前的交互确认（定时任务/脚本用；非终端运行自动跳过）")
 	logLevel := fs.String("log-level", "", "覆盖 runtime.log_level")
 	dbPath := fs.String("db-path", "", "覆盖 runtime.db_path")
 	if err := fs.Parse(args); err != nil {
@@ -110,6 +114,12 @@ func cmdRun(args []string) int {
 	if cfg.Runtime.Apply {
 		log.Warn("live 模式：将执行计划写入 AdGuard Home（syncer 唯一写侧）")
 	}
+	// live 写入前确认：交互终端（未 --yes）时列出 CF 域名清单请用户确认；
+	// 定时任务 / 脚本（非终端）或显式 --yes 时跳过，保持无人值守。
+	var confirm func(planner.Plan) bool
+	if cfg.Runtime.Apply && !*yes && stdinIsTTY() {
+		confirm = confirmPlan
+	}
 	// 确保状态库目录存在（首次运行 ./data 不存在时 sqlite 无法自行建目录）。
 	if dir := filepath.Dir(cfg.Runtime.DBPath); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -126,10 +136,11 @@ func cmdRun(args []string) int {
 	defer func() { _ = db.Close() }()
 
 	_, code, err := pipeline.Run(context.Background(), cfg, pipeline.Deps{
-		Client: client,
-		DB:     db,
-		Log:    log,
-		Stdout: os.Stdout,
+		Client:  client,
+		DB:      db,
+		Log:     log,
+		Stdout:  os.Stdout,
+		Confirm: confirm,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "运行失败（退出码 %d）: %v\n", code, err)
@@ -138,7 +149,45 @@ func cmdRun(args []string) int {
 		}
 		return code
 	}
+	if code == pipeline.ExitCancelled {
+		fmt.Fprintln(os.Stderr, "已取消写入（退出码 5）；本轮未对 AdGuard Home 做任何写操作，计划已打印在上方。")
+	}
 	return code
+}
+
+// stdinIsTTY 标准输入是否为交互终端（cron / 管道 / 重定向均视为非交互）。
+func stdinIsTTY() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// confirmPlan live 写入前确认：逐条列出 CF 域名变更清单（add/update/remove），
+// 仅 y / yes 继续写入；EOF（如管道输入）与其他任何输入均视为取消。
+func confirmPlan(plan planner.Plan) bool {
+	fmt.Println()
+	fmt.Println("──────────────── 写入确认 ────────────────")
+	fmt.Printf("本轮将向 AdGuard Home 写入 %d 条变更（新增 %d / 更新 %d / 移除 %d）:\n",
+		plan.Count(planner.ActionAdd)+plan.Count(planner.ActionUpdate)+plan.Count(planner.ActionRemove),
+		plan.Count(planner.ActionAdd), plan.Count(planner.ActionUpdate), plan.Count(planner.ActionRemove))
+	printConfirmEntries := func(verb string, entries []planner.Entry) {
+		for _, e := range entries {
+			fmt.Printf("  [%s] %-46s → %s\n", verb, e.Domain, e.Answer)
+		}
+	}
+	printConfirmEntries("新增", plan.Add)
+	printConfirmEntries("更新", plan.Update)
+	printConfirmEntries("移除", plan.Remove)
+	fmt.Println("移除条目仅涉及本工具托管集合，用户手工添加的 rewrite 不受影响。")
+	fmt.Print("确认执行写入？输入 y 继续，其他任意输入取消: ")
+	var resp string
+	if _, err := fmt.Fscanln(os.Stdin, &resp); err != nil {
+		return false
+	}
+	resp = strings.ToLower(strings.TrimSpace(resp))
+	return resp == "y" || resp == "yes"
 }
 
 func cmdExport(args []string) int {
