@@ -74,6 +74,53 @@ release_base_url() {
 }
 
 ########################################
+# GitHub 下载兜底：直连失败依次尝试镜像加速前缀
+########################################
+# 镜像站可用性随时间变化，失败仅影响兜底重试，不影响直连成功路径。
+GH_MIRRORS=("https://ghfast.top" "https://gh-proxy.com" "https://ghproxy.net")
+
+# gh_download <url> <output>：先直连，失败后经镜像加速重试；非 GitHub 官方源不做镜像兜底。
+gh_download() {
+    local url=$1 out=$2 m
+    if curl -fL --connect-timeout 10 --retry 1 "$url" -o "$out"; then return 0; fi
+    case "$url" in
+        https://github.com/*|https://raw.githubusercontent.com/*) ;;
+        *) return 1 ;;
+    esac
+    _yellow "GitHub 直连失败，尝试镜像加速兜底: $url"
+    for m in "${GH_MIRRORS[@]}"; do
+        _blue "  ==> 镜像 $m"
+        if curl -fL --connect-timeout 10 --retry 1 "$m/$url" -o "$out"; then
+            _green "[ok] 已通过镜像下载成功"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# resolve_latest_tag <repo_root>：解析 releases/latest 真实 tag（直连优先，镜像兜底）。
+# 直连取 302 Location；镜像可能透传或改写 Location，统一从最终 URL 尾段提取并校验。
+resolve_latest_tag() {
+    local repo_root=$1 u m latest tag
+    local -a urls=("$repo_root")
+    case "$repo_root" in
+        https://github.com/*)
+            for m in "${GH_MIRRORS[@]}"; do urls+=("$m/$repo_root"); done ;;
+    esac
+    for u in "${urls[@]}"; do
+        latest=$(curl -fsS --connect-timeout 10 -o /dev/null -w '%{redirect_url}' \
+            "$u/releases/latest" 2>/dev/null || true)
+        [ -z "$latest" ] && latest=$(curl -fsSL --connect-timeout 10 -o /dev/null \
+            -w '%{url_effective}' "$u/releases/latest" 2>/dev/null || true)
+        tag=${latest##*/}
+        case "$tag" in
+            v[0-9]*|[0-9]*) echo "$tag"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+########################################
 # 获取二进制：本地二进制 > 本地 tar.gz > 远程拉取
 ########################################
 fetch_binary() {
@@ -103,18 +150,21 @@ fetch_binary() {
         _yellow "请把发布 tar.gz 或解压后的二进制与本脚本放同一目录，或用 --url 指定拉取基址。"
         exit 1
     fi
-    # 跟随 /releases/latest 重定向取真实 tag，拼出确定资产名。
+    # 跟随 /releases/latest 重定向取真实 tag，拼出确定资产名；直连失败自动镜像兜底。
     local repo_root latest tag
     repo_root="${base%/releases/*}"
-    latest=$(curl -fsS -o /dev/null -w '%{redirect_url}' "$repo_root/releases/latest" || true)
-    tag=${latest##*/}
-    if [ -z "$tag" ]; then
+    if ! tag=$(resolve_latest_tag "$repo_root"); then
         _red "获取最新版本号失败（GitHub 不可达或尚无 Release）: $repo_root/releases/latest"
+        _yellow "可手动下载发布包后与本脚本放同目录重试，或用 --url 指定可达基址。"
         exit 1
     fi
     tarball="cf-opt-adguard-${tag}-linux-${arch}.tar.gz"
     _blue "拉取发布包: $base/$tarball"
-    curl -fL "$base/$tarball" -o "$dest_dir/$tarball"
+    if ! gh_download "$base/$tarball" "$dest_dir/$tarball"; then
+        _red "发布包下载失败（直连与镜像均不可达）: $base/$tarball"
+        _yellow "可手动下载发布包后与本脚本放同目录重试，或用 --url 指定可达基址。"
+        exit 1
+    fi
     tar -xzf "$dest_dir/$tarball" -C "$dest_dir" --strip-components=1 \
         "cf-opt-adguard-${tag}-linux-${arch}/cf-opt-adguard"
     rm -f "$dest_dir/$tarball"
@@ -129,8 +179,8 @@ fetch_cfst() {
     url="$CFST_RELEASE_BASE/cfst_linux_${arch}.tar.gz"
     _blue "==> 拉取 CloudflareSpeedTest 最新版（linux/${arch}）"
     tmp=$(mktemp -d)
-    if ! curl -fL --retry 2 "$url" -o "$tmp/cfst.tar.gz"; then
-        _red "cfst 下载失败: $url"; rm -rf "$tmp"; return 1
+    if ! gh_download "$url" "$tmp/cfst.tar.gz"; then
+        _red "cfst 下载失败（直连与镜像均不可达）: $url"; rm -rf "$tmp"; return 1
     fi
     # 包内顶层目录为 cfst_linux_<arch>/，strip 一层落到 cfst 目录（含 cfst/ip.txt/ipv6.txt）。
     tar -xzf "$tmp/cfst.tar.gz" -C "$dir" --strip-components=1
@@ -633,11 +683,11 @@ install_manage_script() {
         cp "$0" "$tmp"
     else
         _blue "==> 保存管理脚本副本（从 GitHub 拉取）"
-        curl -fsSL "$SCRIPT_URL" -o "$tmp" || {
+        if ! gh_download "$SCRIPT_URL" "$tmp"; then
             rm -f "$tmp"
-            _yellow "管理脚本副本下载失败，跳过快捷命令安装"
+            _yellow "管理脚本副本下载失败（直连与镜像均不可达），跳过快捷命令安装"
             return 1
-        }
+        fi
     fi
     chmod 755 "$tmp"
     mv -f "$tmp" "$(manage_sh)"
