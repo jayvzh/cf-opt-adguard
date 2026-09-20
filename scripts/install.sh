@@ -353,7 +353,7 @@ prompt_answers() {
     _blue_bold "── 3/3 CloudflareSpeedTest ────────────────"
     ask_str cfst_dir "cfst 目录" "$cfst_dir"
     while true; do
-        ask_str _v "cfst 命令（首词 ./cfst|cfst|*/cfst，选项以 - 开头）" "$cfst_cmd"
+        ask_str _v "cfst 命令" "$cfst_cmd"
         if validate_cfst_cmd "$_v"; then cfst_cmd=$_v; break; fi
         _red "cfst 命令格式非法（示例：./cfst -tl 200 -dn 20），请重新输入"
     done
