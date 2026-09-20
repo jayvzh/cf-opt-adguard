@@ -21,6 +21,7 @@ CFST_RELEASE_BASE="https://github.com/XIU2/CloudflareSpeedTest/releases/latest/d
 action=""
 arch=""
 install_dir=""
+install_dir_explicit=false   # 是否经 --install-dir 显式指定（指定后安装向导不再询问目录）
 arg_url=""          # --url 覆盖拉取基址
 skip_schedule=false
 with_cfst=false     # --with-cfst：安装时自动拉取 cfst 依赖
@@ -147,10 +148,10 @@ ensure_cfst() {
     if [ "$with_cfst" = true ]; then
         fetch_cfst "$cfst_dir"
     elif [ -t 0 ]; then
-        local _c="y"
-        read -rp "未检测到 $cfst_dir/cfst，是否自动下载 CloudflareSpeedTest 最新版？(Y/n): " _c || _c="n"
-        if [ "${_c:-y}" = "y" ]; then fetch_cfst "$cfst_dir"; else
-            _yellow "已跳过；稍后可用管理菜单「安装/更新 CloudflareSpeedTest」补装。"
+        if ask_yesno "未检测到 $cfst_dir/cfst，是否自动下载 CloudflareSpeedTest 最新版" y; then
+            fetch_cfst "$cfst_dir"
+        else
+            _yellow "已跳过；稍后可用管理菜单「6. 更新 CloudflareSpeedTest」补装。"
         fi
     else
         _yellow "未检测到 $cfst_dir/cfst；非交互模式可加 --with-cfst 自动下载。"
@@ -202,6 +203,91 @@ ask_defaults() {
     resolvers=${resolvers:-${RESOLVERS:-223.5.5.5,119.29.29.29}}
 }
 
+# ask_str <变量名> <提示> <默认值>：统一"回车采用默认值"输入，提示格式「提示 [默认值]: 」。
+# 结果通过 printf -v 写回调用者指定变量；EOF / 直接回车均取默认值。
+ask_str() {
+    local __var=$1 __prompt=$2 __def=$3 __val
+    read -rp "$__prompt [$__def]: " __val || true
+    printf -v "$__var" '%s' "${__val:-$__def}"
+}
+
+# ask_install_dir 安装第 0 步：确认安装目录，回车使用默认路径（或已安装的旧路径）；
+# 系统目录非 root / 空输入原地报错重输，避免走到 mkdir 才失败。
+ask_install_dir() {
+    local __def=${install_dir:-$DEFAULT_INSTALL_DIR} __in
+    echo
+    _blue_bold "── 0/3 安装目录 ────────────────────────────"
+    while true; do
+        read -rp "安装目录（回车使用 $__def）: " __in || { _red "输入流已关闭"; exit 1; }
+        install_dir=${__in:-$__def}
+        # read 不做 tilde 展开，手动处理 ~；相对路径转绝对（指针文件 / settings 依赖绝对路径）。
+        install_dir=${install_dir/#\~\//$HOME/}
+        install_dir=${install_dir/#\~/$HOME}
+        case "$install_dir" in /*) ;; *) install_dir="$PWD/$install_dir" ;; esac
+        if [ "${#install_dir}" -gt 1 ]; then install_dir=${install_dir%/}; fi
+        if [ -z "$install_dir" ] || [ "$install_dir" = "/" ]; then
+            _red "安装目录不能为空或为根目录，请重新输入"
+            continue
+        fi
+        case "$install_dir" in
+            /opt/*|/etc/*|/usr/*|/var/*)
+                is_root || { _red "写入 $install_dir 需要 root；请重新输入用户目录（如 $HOME/$APP_NAME），或用 sudo 运行。"; continue; } ;;
+        esac
+        break
+    done
+}
+
+# ask_interval 运行间隔交互：读整行解析"天 小时"两个非负整数，回车沿用当前值；
+# 非法格式（只输一个值 / 非数字 / 总间隔 <1 小时）原地报错重输。
+ask_interval() {
+    local __line __d __h
+    local -a __toks
+    while true; do
+        read -rp "运行间隔（天 小时，如 0 6=每6小时、1 0=每天；回车沿用 $interval_days $interval_hours）: " __line || return 1
+        [ -z "$__line" ] && return 0
+        # read -a 只分词不做 glob 展开，避免输入 * 等字符被展开成文件名。
+        read -ra __toks <<< "$__line"
+        __d=${__toks[0]:-}; __h=${__toks[1]:-}
+        if [ "${#__toks[@]}" -eq 2 ] \
+            && case "$__d" in ''|*[!0-9]*) false ;; *) true ;; esac \
+            && case "$__h" in ''|*[!0-9]*) false ;; *) true ;; esac \
+            && [ $((10#$__d * 24 + 10#$__h)) -ge 1 ]; then
+            interval_days=$__d; interval_hours=$__h
+            return 0
+        fi
+        _red "间隔格式非法：请输入两个以空格分隔的非负整数（天 小时），且总间隔至少 1 小时；请重新输入"
+    done
+}
+
+# ask_yesno <提示> <y|n>：统一 (Y/n) 确认；回车取默认值（第二参数 y / n），
+# 仅接受 y/yes/n/no（不区分大小写），非法输入报错重问；EOF 视为取消（返回 1）。
+ask_yesno() {
+    local __prompt=$1 __def=$2 __r __hint="(Y/n)"
+    [ "$__def" = "n" ] && __hint="(y/N)"
+    while true; do
+        read -rp "$__prompt $__hint: " __r || return 1
+        case "${__r:-$__def}" in
+            y|Y|yes|Yes|YES) return 0 ;;
+            n|N|no|No|NO) return 1 ;;
+            *) _red "请输入 y 或 n" ;;
+        esac
+    done
+}
+
+# agh_precheck 同步前置预检：settings 凭据齐全时先验证 AGH 可达且凭据有效，
+# 失败返回 1（run-once 场景避免 CFST 测速数分钟后才发现 AGH 故障，白跑一轮）。
+agh_precheck() {
+    [ -n "$agh_url" ] && [ -n "$agh_pass" ] || return 0
+    local code; code=$(check_agh_connection)
+    if [ "$code" != "200" ]; then
+        _red "AGH 连接预检失败（HTTP $code）: $agh_url"
+        [ "$code" = "401" ] || [ "$code" = "403" ] && _yellow "用户名或密码错误，可用菜单 7 重新配置。"
+        [ "$code" = "000" ] && _yellow "地址不可达：检查 AGH 地址 / 端口 / 网络。"
+        return 1
+    fi
+    _green "[ok] AGH 连接正常: $agh_url"
+}
+
 prompt_answers() {
     # 非交互模式（stdin 非 tty）且必填项齐全时跳过提问，直接校验。
     if [ ! -t 0 ] && [ -n "$agh_url" ] && [ -n "$agh_pass" ]; then
@@ -220,36 +306,62 @@ prompt_answers() {
     echo
     _blue_bold "── 1/3 AdGuard Home 连接 ──────────────────"
     # 问完立即连接预检，失败则重新输入（地址 / 凭据错误尽早暴露）。
-    local code
+    local code _p
     while true; do
-        while [ -z "$agh_url" ]; do
+        if [ -n "$agh_url" ]; then
+            ask_str agh_url "AGH 地址（回车沿用已保存地址）" "$agh_url"
+        else
             read -rp "AGH 地址（如 http://192.168.1.2:3000）: " agh_url || { _red "输入流已关闭且未提供 AGH 地址"; exit 1; }
-        done
-        read -rp "AGH 用户名（默认 $agh_user）: " _u; agh_user=${_u:-$agh_user}
-        if [ -z "$agh_pass" ]; then
-            printf "AGH 密码: "; read -rs agh_pass; echo
+        fi
+        ask_str agh_user "AGH 用户名" "$agh_user"
+        if [ -n "$agh_pass" ]; then
+            printf "AGH 密码（回车沿用已保存密码，直接输入则覆盖）: "
+            read -rs _p || { _red "输入流已关闭"; exit 1; }; echo
+            agh_pass=${_p:-$agh_pass}
+        else
+            printf "AGH 密码: "
+            read -rs agh_pass || { _red "输入流已关闭"; exit 1; }; echo
         fi
         code=$(check_agh_connection)
         [ "$code" = "200" ] && break
         _red "AGH 连接预检失败（HTTP $code）: $agh_url"
         [ "$code" = "401" ] || [ "$code" = "403" ] && _yellow "用户名或密码错误，请重新输入。"
         [ "$code" = "000" ] && _yellow "地址不可达：检查 AGH 地址 / 端口 / 网络后重新输入。"
-        agh_url=""; agh_pass=""
+        agh_pass=""   # 地址保留（下次可回车沿用），仅清密码强制重输
     done
     _green "[ok] AGH 连接正常: $agh_url"
-    read -rp "统计窗口 24h/7d/30d（默认 $window）: " _w; window=${_w:-$window}
+    # 带校验的输入统一走临时变量 _v：非法值不写回业务变量，
+    # 重输时提示里的 [默认值] 始终是上一个合法值。
+    local _v
+    while true; do
+        ask_str _v "统计窗口（可选 24h/7d/30d/2w）" "$window"
+        case "$_v" in 24h|7d|30d|2w) window=$_v; break ;; *) _red "统计窗口非法（仅支持 24h/7d/30d/2w），请重新输入" ;; esac
+    done
 
     echo
     _blue_bold "── 2/3 聚合与调度 ──────────────────────────"
-    read -rp "点击频次 min-hits（默认 $min_hits）: " _m; min_hits=${_m:-$min_hits}
-    read -rp "运行间隔（天 小时，一行两个数，如 '0 6'=每6小时, '1 0'=每天，默认 $interval_days $interval_hours）: " _d _h
-    interval_days=${_d:-$interval_days}; interval_hours=${_h:-$interval_hours}
+    while true; do
+        ask_str _v "点击频次 min-hits（正整数）" "$min_hits"
+        if case "$_v" in ''|*[!0-9]*) false ;; *) [ "$_v" -ge 1 ] 2>/dev/null ;; esac; then
+            min_hits=$_v; break
+        fi
+        _red "点击频次必须为 >= 1 的正整数，请重新输入"
+    done
+    ask_interval || exit 1
 
     echo
     _blue_bold "── 3/3 CloudflareSpeedTest ────────────────"
-    read -rp "cfst 目录（默认 $cfst_dir）: " _c; cfst_dir=${_c:-$cfst_dir}
-    read -rp "cfst 命令（默认 $cfst_cmd）: " _cmd; cfst_cmd=${_cmd:-$cfst_cmd}
-    read -rp "独立 resolver，逗号分隔（默认 $resolvers，勿指向本机 AGH）: " _r; resolvers=${_r:-$resolvers}
+    ask_str cfst_dir "cfst 目录" "$cfst_dir"
+    while true; do
+        ask_str _v "cfst 命令（首词 ./cfst|cfst|*/cfst，选项以 - 开头）" "$cfst_cmd"
+        if validate_cfst_cmd "$_v"; then cfst_cmd=$_v; break; fi
+        _red "cfst 命令格式非法（示例：./cfst -tl 200 -dn 20），请重新输入"
+    done
+    while true; do
+        ask_str _v "独立 resolver，逗号分隔（勿指向本机 AGH）" "$resolvers"
+        if [ -n "$_v" ]; then resolvers=$_v; break; fi
+        _red "resolver 不能为空，请重新输入"
+    done
 
     validate_answers
 }
@@ -537,6 +649,10 @@ _kv() { printf "  \033[1;37m%-12s\033[0m\033[0;32m%s\033[0m\n" "$1" "$2"; }
 # 菜单动作
 ########################################
 do_install() {
+    # 交互安装第 0 步确认目录（回车默认路径）；非交互或显式 --install-dir 时跳过。
+    if [ -t 0 ] && [ "$install_dir_explicit" != true ]; then
+        ask_install_dir
+    fi
     install_dir=${install_dir:-$DEFAULT_INSTALL_DIR}
     if [ -d "$install_dir" ] && [ -f "$install_dir/config.yaml" ]; then
         _yellow "检测到已有安装: $install_dir（将保留 settings.env 并重装）"
@@ -550,7 +666,8 @@ do_install() {
     case "$install_dir" in /opt/*|/etc/*|/usr/*|/var/*)
         is_root || { _red "写入 $install_dir 需要 root，请用 sudo 运行，或 --install-dir 指定用户目录。"; exit 1; } ;;
     esac
-    mkdir -p "$install_dir/logs" "$install_dir/data"
+    mkdir -p "$install_dir/logs" "$install_dir/data" \
+        || { _red "创建目录失败: $install_dir（请检查权限或更换安装目录）"; exit 1; }
 
     fetch_binary "$install_dir"
     chmod +x "$install_dir/cf-opt-adguard"
@@ -575,9 +692,9 @@ do_install() {
     shortcut_hint
     echo "──────────────────────────────────────────────"
     echo
-    _y="n"
-    if [ -t 0 ]; then read -rp "是否立即运行一次验证？(y/N): " _y || _y="n"; fi
-    if [ "$_y" = "y" ]; then do_run_once; fi
+    if [ -t 0 ] && ask_yesno "是否立即运行一次验证（测速 + 同步）" n; then
+        do_run_once || true
+    fi
 }
 
 # cfst 命令简单校验：首词为 ./cfst / cfst / 绝对路径 */cfst；参数为 - 开头的选项，
@@ -616,9 +733,12 @@ do_run_once() {
     # —— 1) cfst 路径检测 ——
     if [ ! -x "$cfst_dir/cfst" ]; then
         _red "未检测到 CloudflareSpeedTest: $cfst_dir/cfst"
-        _yellow "请先用管理菜单「7. 安装 / 更新 CloudflareSpeedTest」安装，或 --cfst-dir 指定正确目录。"
+        _yellow "请先用管理菜单「6. 更新 CloudflareSpeedTest」安装，或 --cfst-dir 指定正确目录。"
         return 1
     fi
+
+    # —— 1.5) AGH 前置预检：凭据错误 / 不可达时立即中止，避免测速几分钟白跑 ——
+    agh_precheck || return 1
 
     local interactive=false
     [ -t 0 ] && interactive=true
@@ -642,7 +762,15 @@ do_run_once() {
                         read -rp "  输入 cfst 命令（格式同上，如 ./cfst -tl 200 -dn 20）: " _cmd || return 1
                         if validate_cfst_cmd "$_cmd"; then
                             final_cmd="$_cmd"
-                            _yellow "  本次运行使用新命令（永久修改请用菜单 3）"
+                            # 顺手支持保存：改参数大概率想永久生效，免去再进菜单 7。
+                            if ask_yesno "  是否保存为默认命令" n; then
+                                cfst_cmd="$_cmd"
+                                if save_settings; then
+                                    _green "  [ok] 已保存为默认命令"
+                                else
+                                    _red "  保存失败（settings.env 不可写？），仅本次生效"
+                                fi
+                            fi
                             loop=0
                             break
                         fi
@@ -659,6 +787,7 @@ do_run_once() {
 
     # —— 3) 运行测速（失败即中止，不复用旧 result.csv）——
     echo "=== $(date '+%F %T') CFST 测速开始: $final_cmd ==="
+    _yellow "  测速进行中（视参数通常需要 1-5 分钟），请耐心等待…"
     if ! ( cd "$cfst_dir" && eval "$final_cmd" ); then
         _red "CFST 测速失败，本轮中止。"
         return 1
@@ -675,13 +804,10 @@ do_run_once() {
         echo
         _blue_bold "── 2/3 同步前确认 ─────────────────────────"
         echo "  配置文件: $install_dir/config.yaml"
-        local go
-        read -rp "  配置无误，继续同步？(Y/n): " go || return 1
-        case "${go:-y}" in
-            n|N)
-                _yellow "已取消；可先用菜单 3 修改配置后再运行"
-                return 0 ;;
-        esac
+        if ! ask_yesno "  配置无误，继续同步" y; then
+            _yellow "已取消；可先用菜单 7 重新配置后再运行"
+            return 0
+        fi
     fi
 
     # —— 5) 同步：交互终端下 Go 端写入前会列出 CF 域名清单，需再次确认；非交互自动 --yes ——
@@ -716,16 +842,15 @@ do_run_sync() {
         _yellow "请先运行「立即运行一次」完成 CFST 测速，或检查 --cfst-dir 配置。"
         return 1
     fi
+    agh_precheck || return 1
     if [ -t 0 ]; then
         echo
         _blue_bold "── 同步前确认 ─────────────────────────────"
         echo "  配置文件: $install_dir/config.yaml"
         echo "  测速结果: $csv"
-        local go
-        read -rp "  使用现有测速结果同步？(Y/n): " go || return 1
-        case "${go:-y}" in
-            n|N) _yellow "已取消"; return 0 ;;
-        esac
+        if ! ask_yesno "  使用现有测速结果同步" y; then
+            _yellow "已取消"; return 0
+        fi
     fi
     echo "=== $(date '+%F %T') 同步开始（跳过测速） ==="
     local rc=0
@@ -750,9 +875,14 @@ do_logs() {
     fi
     local n=50
     if [ -t 0 ]; then
-        read -rp "显示最近多少行？（默认 50）: " n || return 0
-        n=${n:-50}
-        echo "$n" | grep -qE '^[0-9]+$' || { _red "行数须为正整数"; return 1; }
+        local _v
+        while true; do
+            ask_str _v "显示最近多少行" 50
+            if case "$_v" in ''|*[!0-9]*) false ;; *) [ "$_v" -ge 1 ] 2>/dev/null ;; esac; then
+                n=$_v; break
+            fi
+            _red "行数须为正整数，请重新输入"
+        done
     fi
     echo
     _blue "—— $log（最近 $n 行）——"
@@ -772,17 +902,15 @@ last_run_info() {
     local log="$install_dir/logs/run.log"
     if [ -f "$log" ]; then
         local last
-        last=$(grep -a '=== ' "$log" | tail -n 1)
-        [ -n "$last" ] && { echo "最近运行标记: $last"; return; }
+        last=$(grep -a '=== ' "$log" | tail -n 1 | sed 's/^=== //; s/ ===$//')
+        [ -n "$last" ] && { echo "最近运行: $last"; return; }
     fi
     echo "暂无运行记录"
 }
 
 # 重新配置运行间隔（定时任务子菜单）：更新 settings / wrapper 并重装定时任务。
 do_reschedule() {
-    local _d _h
-    read -rp "运行间隔（天 小时，如 '0 6'=每6小时, '1 0'=每天，当前 $interval_days $interval_hours）: " _d _h || return 1
-    interval_days=${_d:-$interval_days}; interval_hours=${_h:-$interval_hours}
+    ask_interval || return 1
     validate_answers
     save_settings
     gen_wrapper
@@ -813,8 +941,8 @@ do_cron() {
         echo "  0. 返回主菜单"
         read -rp "  请输入选项: " c || return 0
         case "$c" in
-            1) do_toggle ;;
-            2) do_reschedule ;;
+            1) do_toggle || true ;;
+            2) do_reschedule || true ;;
             3) remove_schedule; _green "✅ 定时任务已卸载（主程序与配置保留）" ;;
             0|q|Q) return 0 ;;
             *) _red "  无效选项" ;;
@@ -906,6 +1034,21 @@ do_install_cfst() {
 
 do_uninstall() {
     install_dir=${install_dir:-$DEFAULT_INSTALL_DIR}
+    # 交互模式下高危操作先确认（默认取消），并列出将删除的内容；
+    # 非交互（CLI / 脚本调用）保持直接执行。
+    if [ -t 0 ]; then
+        echo
+        _red_bold "⚠ 卸载将删除以下内容："
+        echo "  - 定时任务（systemd timer / cron）"
+        echo "  - 快捷命令 $MANAGE_BIN 与指针文件 $POINTER_FILE"
+        if [ -d "$install_dir" ]; then
+            echo "  - 安装目录 $install_dir（含配置、AGH 凭据、状态库与日志）"
+        fi
+        if ! ask_yesno "确认卸载" n; then
+            _yellow "已取消卸载"
+            return 0
+        fi
+    fi
     remove_schedule
     remove_menu_shortcut
     if [ -d "$install_dir" ]; then
@@ -927,9 +1070,10 @@ menu() {
     ask_defaults   # settings 大写变量 → 业务小写变量（间隔显示用）
 
     # 一行简单状态：版本｜同步间隔｜定时状态｜安装路径
+    # version 输出格式 "cf-opt-adguard 0.1.0-dev (linux/amd64, go1.x)"，版本号在第 2 列。
     local ver="-" installed=false
     if [ -x "$install_dir/cf-opt-adguard" ]; then
-        ver=$("$install_dir/cf-opt-adguard" version 2>/dev/null | awk '{print $3}')
+        ver=$("$install_dir/cf-opt-adguard" version 2>/dev/null | awk '{print $2}')
         ver=${ver:-"?"}
         installed=true
     fi
@@ -944,6 +1088,9 @@ menu() {
     echo -e "\033[1;36m  ║\033[0m\033[1;37m        cf-opt-adguard 管理菜单\033[0m\033[1;36m               ║"
     echo -e "\033[1;36m  ╚══════════════════════════════════════════════╝\033[0m"
     echo -e "\033[1;37m   $APP_NAME\033[0m $ver ｜ 同步间隔 每$(total_hours)h ｜ $sched ｜ $install_dir"
+    if [ "$installed" = true ]; then
+        echo "   上次运行: $(last_run_info)"
+    fi
     if [ -x "$MANAGE_BIN" ] || [ -L "$MANAGE_BIN" ]; then
         echo -e "\033[0;33m   提示: 任意目录运行 $APP_NAME 均可打开本菜单\033[0m"
     fi
@@ -956,14 +1103,14 @@ menu() {
         echo "   2. 帮助"
         echo "   0. 退出"
         echo
-        read -rp "  请输入选项: " choice
+        read -rp "  请输入选项: " choice || { echo; exit 0; }
         case "$choice" in
             1) action="install" ;;
             2) action="help" ;;
-            0) exit 0 ;;
-            *) return ;;
+            0|q|Q) exit 0 ;;
+            *) _red "  无效选项，请重新输入"; return ;;
         esac
-        dispatch "$action"
+        dispatch "$action" || true
         return
     fi
 
@@ -984,7 +1131,7 @@ menu() {
     echo "   9. 帮助"
     echo "   0. 退出"
     echo
-    read -rp "  请输入选项: " choice
+    read -rp "  请输入选项: " choice || { echo; exit 0; }
     case "$choice" in
         1) action="run-sync" ;;
         2) action="run-once" ;;
@@ -995,10 +1142,10 @@ menu() {
         7) action="reconfig" ;;
         8) action="uninstall" ;;
         9) action="help" ;;
-        0) exit 0 ;;
-        *) return ;;
+        0|q|Q) exit 0 ;;
+        *) _red "  无效选项，请重新输入"; return ;;
     esac
-    dispatch "$action"
+    dispatch "$action" || true
 }
 
 parse_args() {
@@ -1020,7 +1167,7 @@ parse_args() {
             --cfst-dir)    cfst_dir="$2"; shift 2 ;;
             --cfst-cmd)    cfst_cmd="$2"; shift 2 ;;
             --resolvers)   resolvers="$2"; shift 2 ;;
-            --install-dir) install_dir="$2"; shift 2 ;;
+            --install-dir) install_dir="$2"; install_dir_explicit=true; shift 2 ;;
             --url)         arg_url="$2"; shift 2 ;;
             --skip-schedule) skip_schedule=true; shift ;;
             --with-cfst)   with_cfst=true; shift ;;

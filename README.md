@@ -45,12 +45,12 @@ cd /opt/cfst                                # cfst 目录：cfst、cf-opt-adguar
 一条命令拉取脚本并进入交互菜单（会自动下载最新发布包并安装，需联网）：
 
 ```bash
-sudo bash <(curl -sL https://github.com/jayvzh/cf-opt-adguard/raw/refs/heads/main/scripts/install.sh)
+bash <(curl -sL https://github.com/jayvzh/cf-opt-adguard/raw/refs/heads/main/scripts/install.sh)
 ```
 
 > 注意必须是进程替换 `<(...)`，不能写成 `curl ... | bash`——直管道会占住标准输入导致向导无法回答。脚本检测到这种误用时会报错并给出正确命令。
 
-安装向导会依次询问：AGH 地址与凭据、统计窗口（24h/7d/30d/2w）、点击频次阈值、运行间隔（一行输入"天 小时"，如 `0 6` = 每 6 小时、`1 0` = 每天）、CFST 目录与测速命令（默认 `./cfst -tl 200 -dn 20`）、独立 resolver；若目录中没有 cfst，会询问是否自动从 [CloudflareSpeedTest 官方 Release](https://github.com/XIU2/CloudflareSpeedTest/releases) 下载最新版（amd64/arm64 自动匹配）。
+安装向导第 0 步先确认**安装目录**（直接回车使用默认 `/opt/cf-opt-adguard`，已安装过则默认沿用旧路径），随后依次询问：AGH 地址与凭据（输完立即连接预检，失败原地重输）、统计窗口（24h/7d/30d/2w）、点击频次阈值、运行间隔（一行输入"天 小时"，如 `0 6` = 每 6 小时、`1 0` = 每天）、CFST 目录与测速命令（默认 `./cfst -tl 200 -dn 20`）、独立 resolver。所有带默认值的项**直接回车即采用默认值**（提示中以 `[当前默认]` 标注），非法输入会报错并要求重新输入；若目录中没有 cfst，会询问是否自动从 [CloudflareSpeedTest 官方 Release](https://github.com/XIU2/CloudflareSpeedTest/releases) 下载最新版（amd64/arm64 自动匹配）。
 
 安装完成后会额外创建**快捷命令** `cf-opt-adguard`（软链到安装目录内的管理脚本副本，非 root 安装则跳过并提示手动方式），任意目录直接运行即可打开管理菜单：
 
