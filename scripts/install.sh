@@ -278,11 +278,11 @@ ask_yesno() {
 # 失败返回 1（run-once 场景避免 CFST 测速数分钟后才发现 AGH 故障，白跑一轮）。
 agh_precheck() {
     [ -n "$agh_url" ] && [ -n "$agh_pass" ] || return 0
-    local code; code=$(check_agh_connection)
+    local code; agh_probe; code=$AGH_CODE
     if [ "$code" != "200" ]; then
         _red "AGH 连接预检失败（HTTP $code）: $agh_url"
         [ "$code" = "401" ] || [ "$code" = "403" ] && _yellow "用户名或密码错误，可用菜单 7 重新配置。"
-        [ "$code" = "000" ] && _yellow "地址不可达：检查 AGH 地址 / 端口 / 网络。"
+        agh_fail_hint "$code"
         return 1
     fi
     _green "[ok] AGH 连接正常: $agh_url"
@@ -293,11 +293,11 @@ prompt_answers() {
     if [ ! -t 0 ] && [ -n "$agh_url" ] && [ -n "$agh_pass" ]; then
         _blue "==> 非交互模式，使用命令行参数与默认值"
         validate_answers
-        local code; code=$(check_agh_connection)
+        local code; agh_probe; code=$AGH_CODE
         if [ "$code" != "200" ]; then
             _red "AGH 连接预检失败（HTTP $code）: $agh_url"
             [ "$code" = "401" ] || [ "$code" = "403" ] && _yellow "用户名或密码错误。"
-            [ "$code" = "000" ] && _yellow "地址不可达：检查 AGH 地址 / 端口 / 网络。"
+            agh_fail_hint "$code"
             exit 1
         fi
         _green "[ok] AGH 连接正常: $agh_url"
@@ -322,11 +322,11 @@ prompt_answers() {
             printf "AGH 密码: "
             read -rs agh_pass || { _red "输入流已关闭"; exit 1; }; echo
         fi
-        code=$(check_agh_connection)
+        agh_probe; code=$AGH_CODE
         [ "$code" = "200" ] && break
         _red "AGH 连接预检失败（HTTP $code）: $agh_url"
         [ "$code" = "401" ] || [ "$code" = "403" ] && _yellow "用户名或密码错误，请重新输入。"
-        [ "$code" = "000" ] && _yellow "地址不可达：检查 AGH 地址 / 端口 / 网络后重新输入。"
+        agh_fail_hint "$code"
         agh_pass=""   # 地址保留（下次可回车沿用），仅清密码强制重输
     done
     _green "[ok] AGH 连接正常: $agh_url"
@@ -379,15 +379,40 @@ validate_answers() {
 total_hours() { echo $((interval_days * 24 + interval_hours)); }
 
 # AGH 连接预检：POST /control/login 拿会话（只读），尽早暴露地址不可达/凭据错误。
-# 输出 HTTP 码：200=成功；401/403=凭据错误；000=不可达。
-check_agh_connection() {
-    local code esc_user esc_pass
-    esc_user=$(printf '%s' "$agh_user" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    esc_pass=$(printf '%s' "$agh_pass" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    code=$(curl -sS -m 8 -o /dev/null -w '%{http_code}' -X POST "$agh_url/control/login" \
+# 无 stdout 输出（避免 $( ) 子 shell 吞全局变量），结果写全局：AGH_CODE / CURL_RC / CURL_ERR。
+# --noproxy '*'：AGH 属内网直连地址，绕过 shell 代理变量（Clash 等代理会劫持内网请求导致 000，
+# 且 systemd/cron 执行主程序时也不带代理环境，此处直连与其行为一致）。
+agh_probe() {
+    local _tmp
+    _tmp=$(mktemp) || { AGH_CODE=000; CURL_RC=1; CURL_ERR="mktemp 失败"; return 0; }
+    AGH_CODE=$(curl -sS -m 8 --noproxy '*' -o /dev/null -w '%{http_code}' -X POST \
+        "$agh_url/control/login" \
         -H 'Content-Type: application/json' \
-        -d "{\"name\":\"$esc_user\",\"password\":\"$esc_pass\"}" 2>/dev/null) || code=000
-    echo "$code"
+        -d "{\"name\":\"$agh_user\",\"password\":\"$agh_pass\"}" 2>"$_tmp") && CURL_RC=0 || CURL_RC=$?
+    AGH_CODE=${AGH_CODE:-000}
+    CURL_ERR=$(cat "$_tmp" 2>/dev/null || true)
+    rm -f "$_tmp"
+}
+
+# agh_fail_hint 预检失败时输出可操作的排查信息：curl 退出码映射 + 原始错误 + 手动复测命令。
+agh_fail_hint() {
+    local code=$1
+    [ "$code" = "401" ] || [ "$code" = "403" ] && return 0  # 凭据错误无需连接层诊断
+    local reason
+    case "$CURL_RC" in
+        0)   reason="服务未返回有效 HTTP 响应" ;;
+        5)   reason="代理解析失败：环境代理变量指向不可用代理（已尝试绕过仍失败）" ;;
+        6)   reason="域名解析失败" ;;
+        7)   reason="连接被拒绝：端口未开放或 AGH 未监听该地址（核对端口；若 AGH 仅绑定 127.0.0.1 需换可达地址）" ;;
+        28)  reason="连接超时：网络不可达或防火墙拦截" ;;
+        35)  reason="TLS 握手失败" ;;
+        52)  reason="服务返回空响应：该端口可能是 HTTPS 服务，请把地址改为 https:// 前缀重试" ;;
+        60)  reason="证书校验失败：AGH 使用自签名 HTTPS；主程序同样无法信任，请改用 http:// 监听地址或部署受信证书" ;;
+        *)   reason="curl 退出码 $CURL_RC" ;;
+    esac
+    _yellow "  连接层失败: $reason"
+    [ -n "$CURL_ERR" ] && _yellow "  curl 原始错误: $CURL_ERR"
+    _yellow "  手动复测: curl -v -m 8 --noproxy '*' -X POST '$agh_url/control/login' -H 'Content-Type: application/json' -d '{\"name\":\"用户名\",\"password\":\"密码\"}'"
 }
 
 save_settings() {
@@ -470,6 +495,13 @@ EOF
     chmod 600 "$install_dir/config.yaml"
 }
 
+# 主程序统一调用入口：注入 no_proxy='*' 使其 HTTP 请求与 systemd/cron 定时环境
+# （无代理变量）行为一致，避免交互 shell 的 http_proxy 等劫持对内网 AGH 的请求
+# （Go 标准 http.Client 默认 ProxyFromEnvironment 会读这些变量）。
+run_main() {
+    no_proxy='*' NO_PROXY='*' "$install_dir/cf-opt-adguard" "$@"
+}
+
 gen_wrapper() {
     local th; th=$(total_hours)
     cat > "$install_dir/run-opt.sh" <<EOF
@@ -479,6 +511,8 @@ set -euo pipefail
 INSTALL_DIR=$(sh_quote "$install_dir")
 CFST_DIR=$(sh_quote "$cfst_dir")
 CFST_CMD=$(sh_quote "$cfst_cmd")
+# 手动调试时也不受 shell 代理变量影响（与 systemd/cron 定时环境一致）
+export no_proxy='*' NO_PROXY='*'
 LOG_DIR="\$INSTALL_DIR/logs"
 mkdir -p "\$LOG_DIR"
 exec >> >(tee -a "\$LOG_DIR/run.log") 2>&1
@@ -814,9 +848,9 @@ do_run_once() {
     echo "=== $(date '+%F %T') 同步开始 ==="
     local rc=0
     if [ "$interactive" = true ]; then
-        "$install_dir/cf-opt-adguard" run -c "$install_dir/config.yaml" --apply || rc=$?
+        run_main run -c "$install_dir/config.yaml" --apply || rc=$?
     else
-        "$install_dir/cf-opt-adguard" run -c "$install_dir/config.yaml" --apply --yes || rc=$?
+        run_main run -c "$install_dir/config.yaml" --apply --yes || rc=$?
     fi
     echo "=== $(date '+%F %T') 同步结束 ==="
     if [ "$rc" -ne 0 ] && [ "$rc" -ne 5 ]; then
@@ -855,9 +889,9 @@ do_run_sync() {
     echo "=== $(date '+%F %T') 同步开始（跳过测速） ==="
     local rc=0
     if [ -t 0 ]; then
-        "$install_dir/cf-opt-adguard" run -c "$install_dir/config.yaml" --apply || rc=$?
+        run_main run -c "$install_dir/config.yaml" --apply || rc=$?
     else
-        "$install_dir/cf-opt-adguard" run -c "$install_dir/config.yaml" --apply --yes || rc=$?
+        run_main run -c "$install_dir/config.yaml" --apply --yes || rc=$?
     fi
     echo "=== $(date '+%F %T') 同步结束 ==="
     [ "$rc" -eq 0 ] || [ "$rc" -eq 5 ] && return 0
